@@ -165,11 +165,6 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
         }
         pthread_mutex_unlock(&device->memory_info.budget_lock);
     }
-    else if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_LOG_MEMORY_BUDGET)
-    {
-        INFO("Freeing memory of type %u, %"PRIu64" KiB.\n",
-                allocation->vk_memory_type, allocation->size / 1024);
-    }
 }
 
 static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
@@ -236,8 +231,8 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
                 *type_current += size;
                 if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_LOG_MEMORY_BUDGET)
                 {
-                    INFO("Allocated memory of type %u, new total allocated size %"PRIu64" MiB.\n",
-                            type_index, *type_current / (1024 * 1024));
+                    INFO("Allocated %"PRIu64" KiB of memory with type %u, new total allocated size %"PRIu64" MiB.\n",
+                            size / 1024, type_index, *type_current / (1024 * 1024));
                 }
             }
             pthread_mutex_unlock(&memory_info->budget_lock);
@@ -262,6 +257,17 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
              * which are also DEVICE_LOCAL.
              * After failure, the calling code removes the DEVICE_LOCAL_BIT flag and tries again,
              * where we will fall back to system memory instead. */
+
+            if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_LOG_MEMORY_BUDGET)
+            {
+                pthread_mutex_lock(&memory_info->budget_lock);
+                INFO("Failed to allocate %"PRIu64" KiB of device memory from memory type %u, "
+                        "currently %"PRIu64" MiB is allocated with this type.\n",
+                        size / 1024,
+                        type_index, memory_info->type_current[type_index] / (1024 * 1024));
+                pthread_mutex_unlock(&memory_info->budget_lock);
+            }
+
             return E_OUTOFMEMORY;
         }
     }
