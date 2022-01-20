@@ -37,6 +37,32 @@ VkResult vkd3d_create_pipeline_cache(struct d3d12_device *device,
 
 #define VKD3D_CACHE_BLOB_VERSION MAKE_MAGIC('V','K','B',2)
 
+enum vkd3d_pipeline_blob_chunk_type
+{
+    /* VkPipelineCache blob data. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE = 0,
+    /* VkShaderStage is stored in upper 16 bits. */
+    /* TODO: We might want to deduplicate the SPIR-V through some extra indirection. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV = 1,
+    /* Metadata we should have obtained from vkd3d-shader. It is sometimes needed when creating a PSO.
+     * VkShaderStage is stored in upper 16 bits. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_META = 2,
+    /* TODO: We can expand this as needed if we get a way to not have to store raw SPIR-V. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_MASK = 0xffff,
+    VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT = 16,
+};
+
+#define VKD3D_PIPELINE_BLOB_CHUNK_ALIGN 4
+struct vkd3d_pipeline_blob_chunk
+{
+    uint32_t type; /* vkd3d_pipeline_blob_chunk_type with extra data in upper bits. */
+    uint32_t size; /* size of data. Does not include size of header. */
+    uint8_t data[];
+};
+
+STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk) == 8);
+STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob_chunk, data) == 8);
+
 struct vkd3d_pipeline_blob
 {
     uint32_t version;
@@ -46,24 +72,17 @@ struct vkd3d_pipeline_blob
     uint64_t vkd3d_build;
     uint64_t vkd3d_shader_interface_key;
     uint8_t cache_uuid[VK_UUID_SIZE];
-    uint8_t vk_blob[];
+    uint8_t data[]; /* vkd3d_pipeline_blob_chunks laid out one after the other with u32 alignment. */
 };
 
-STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, vk_blob) == (32 + VK_UUID_SIZE));
-STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, vk_blob) == sizeof(struct vkd3d_pipeline_blob));
+STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == (32 + VK_UUID_SIZE));
+STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == sizeof(struct vkd3d_pipeline_blob));
 
-HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
-        const struct d3d12_cached_pipeline_state *state, VkPipelineCache *cache)
+static HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+        const struct d3d12_cached_pipeline_state *state)
 {
     const VkPhysicalDeviceProperties *device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
-    VkResult vr;
-
-    if (!state->blob.CachedBlobSizeInBytes)
-    {
-        vr = vkd3d_create_pipeline_cache(device, 0, NULL, cache);
-        return hresult_from_vk_result(vr);
-    }
 
     /* Avoid E_INVALIDARG with an invalid header size, since that may confuse some games */
     if (state->blob.CachedBlobSizeInBytes < sizeof(*blob) || blob->version != VKD3D_CACHE_BLOB_VERSION)
@@ -73,16 +92,72 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
     if (blob->vendor_id != device_properties->vendorID || blob->device_id != device_properties->deviceID)
         return D3D12_ERROR_ADAPTER_NOT_FOUND;
 
-    /* Check the vkd3d build since the shader compiler itself may change,
+    /* Check the vkd3d-proton build since the shader compiler itself may change,
      * and the driver since that will affect the generated pipeline cache.
      * Based on global configuration flags, which extensions are available, etc,
      * the generated shaders may also change, so key on that as well. */
     if (blob->vkd3d_build != vkd3d_build ||
             blob->vkd3d_shader_interface_key != device->shader_interface_key ||
-            memcmp(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE))
+            memcmp(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
-    vr = vkd3d_create_pipeline_cache(device, state->blob.CachedBlobSizeInBytes - sizeof(*blob), blob->vk_blob, cache);
+    return S_OK;
+}
+
+static struct vkd3d_pipeline_blob_chunk *next_blob_chunk(struct vkd3d_pipeline_blob_chunk *chunk)
+{
+    return (struct vkd3d_pipeline_blob_chunk *)&chunk->data[align(chunk->size, VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)];
+}
+
+static const struct vkd3d_pipeline_blob_chunk *find_blob_chunk(const struct vkd3d_pipeline_blob_chunk *chunk,
+        size_t size, uint32_t type)
+{
+    uint32_t aligned_chunk_size;
+
+    while (size >= sizeof(struct vkd3d_pipeline_blob_chunk))
+    {
+        aligned_chunk_size = align(chunk->size + sizeof(struct vkd3d_pipeline_blob_chunk),
+                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        if (aligned_chunk_size > size)
+            return NULL;
+        if (chunk->type == type)
+            return chunk;
+
+        chunk = (const struct vkd3d_pipeline_blob_chunk *)&chunk->data[align(chunk->size, VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)];
+        size -= aligned_chunk_size;
+    }
+
+    return NULL;
+}
+
+HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
+        const struct d3d12_cached_pipeline_state *state, VkPipelineCache *cache)
+{
+    const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    const struct vkd3d_pipeline_blob_chunk *chunk;
+    VkResult vr;
+    HRESULT hr;
+
+    if (!state->blob.CachedBlobSizeInBytes)
+    {
+        vr = vkd3d_create_pipeline_cache(device, 0, NULL, cache);
+        return hresult_from_vk_result(vr);
+    }
+
+    if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, state)))
+        return hr;
+
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
+            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE);
+
+    if (!chunk)
+    {
+        vr = vkd3d_create_pipeline_cache(device, 0, NULL, cache);
+        return hresult_from_vk_result(vr);
+    }
+
+    vr = vkd3d_create_pipeline_cache(device, chunk->size, chunk->data, cache);
     return hresult_from_vk_result(vr);
 }
 
@@ -91,17 +166,22 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
     const VkPhysicalDeviceProperties *device_properties = &state->device->device_info.properties2.properties;
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
     struct vkd3d_pipeline_blob *blob = data;
+    struct vkd3d_pipeline_blob_chunk *chunk;
+    size_t vk_blob_size_pipeline_cache = 0;
     size_t total_size = sizeof(*blob);
     size_t vk_blob_size = 0;
     VkResult vr;
 
     if (state->vk_pso_cache)
     {
-        if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size, NULL))))
+        if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size_pipeline_cache, NULL))))
         {
             ERR("Failed to retrieve pipeline cache size, vr %d.\n", vr);
             return vr;
         }
+
+        vk_blob_size += align(vk_blob_size_pipeline_cache + sizeof(struct vkd3d_pipeline_blob_chunk),
+                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
 
         /* TODO: If configured for it, also serialize out SPIR-V. */
     }
@@ -120,11 +200,15 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
         blob->vkd3d_shader_interface_key = state->device->shader_interface_key;
         blob->vkd3d_build = vkd3d_build;
         memcpy(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE);
+        chunk = (struct vkd3d_pipeline_blob_chunk *)blob->data;
 
         if (state->vk_pso_cache)
         {
-            if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size, blob->vk_blob))))
+            chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE;
+            chunk->size = vk_blob_size_pipeline_cache;
+            if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size_pipeline_cache, chunk->data))))
                 return vr;
+            chunk = next_blob_chunk(chunk);
         }
 
         /* TODO: If configured for it, also serialize out SPIR-V. */
@@ -652,7 +736,7 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
 
     if (header->vkd3d_build != vkd3d_build ||
             header->vkd3d_shader_interface_key != device->shader_interface_key ||
-            memcmp(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE))
+            memcmp(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
     /* The application is not allowed to free the blob, so we
