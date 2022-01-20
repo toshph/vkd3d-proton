@@ -2273,10 +2273,12 @@ CONST_VTBL struct ID3D12PipelineStateVtbl d3d12_pipeline_state_vtbl =
 static HRESULT create_shader_stage(struct d3d12_device *device,
         VkPipelineShaderStageCreateInfo *stage_desc, VkShaderStageFlagBits stage,
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *required_subgroup_size_info,
-        const D3D12_SHADER_BYTECODE *code, const struct vkd3d_shader_interface_info *shader_interface,
+        const D3D12_SHADER_BYTECODE *code, const D3D12_CACHED_PIPELINE_STATE *cached_state,
+        const struct vkd3d_shader_interface_info *shader_interface,
         const struct vkd3d_shader_compile_arguments *compile_args, struct vkd3d_shader_code *spirv_code)
 {
     struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
+    HRESULT hr;
     int ret;
 
     stage_desc->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -2286,13 +2288,20 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
 
-    TRACE("Calling vkd3d_shader_compile_dxbc.\n");
-    if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, 0, shader_interface, compile_args)) < 0)
+    if (SUCCEEDED(hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(device, code, cached_state, stage, spirv_code)))
     {
-        WARN("Failed to compile shader, vkd3d result %d.\n", ret);
-        return hresult_from_vkd3d_result(ret);
+        TRACE("SPIR-V for blob hash %016"PRIx64" received from cached pipeline state.\n", spirv_code->meta.hash);
     }
-    TRACE("Called vkd3d_shader_compile_dxbc.\n");
+    else
+    {
+        TRACE("Calling vkd3d_shader_compile_dxbc.\n");
+        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, 0, shader_interface, compile_args)) < 0)
+        {
+            WARN("Failed to compile shader, vkd3d result %d.\n", ret);
+            return hresult_from_vkd3d_result(ret);
+        }
+        TRACE("Called vkd3d_shader_compile_dxbc.\n");
+    }
 
     if (!d3d12_device_validate_shader_meta(device, &spirv_code->meta))
         return E_INVALIDARG;
@@ -2345,7 +2354,8 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
 }
 
 static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
-        const D3D12_SHADER_BYTECODE *code, const struct vkd3d_shader_interface_info *shader_interface,
+        const D3D12_SHADER_BYTECODE *code, const D3D12_CACHED_PIPELINE_STATE *cached_state,
+        const struct vkd3d_shader_interface_info *shader_interface,
         VkPipelineLayout vk_pipeline_layout, VkPipelineCache vk_cache, VkPipeline *vk_pipeline,
         struct vkd3d_shader_code *spirv_code)
 {
@@ -2368,7 +2378,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
     pipeline_info.flags = 0;
     if (FAILED(hr = create_shader_stage(device, &pipeline_info.stage,
             VK_SHADER_STAGE_COMPUTE_BIT, &required_subgroup_size_info,
-            code, shader_interface, &compile_args, spirv_code)))
+            code, cached_state, shader_interface, &compile_args, spirv_code)))
         return hr;
     pipeline_info.layout = vk_pipeline_layout;
     pipeline_info.basePipelineHandle = VK_NULL_HANDLE;
@@ -2437,7 +2447,7 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
         }
     }
 
-    hr = vkd3d_create_compute_pipeline(device, &desc->cs, &shader_interface,
+    hr = vkd3d_create_compute_pipeline(device, &desc->cs, &desc->cached_pso, &shader_interface,
             root_signature->compute.vk_pipeline_layout,
             state->vk_pso_cache ? state->vk_pso_cache : device->global_pipeline_cache,
             &state->compute.vk_pipeline,
@@ -3518,7 +3528,7 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         shader_interface.xfb_info = shader_stages[i].stage == xfb_stage ? &xfb_info : NULL;
         shader_interface.stage = shader_stages[i].stage;
         if (FAILED(hr = create_shader_stage(device, &graphics->stages[graphics->stage_count],
-                shader_stages[i].stage, NULL, b, &shader_interface,
+                shader_stages[i].stage, NULL, b, &desc->cached_pso, &shader_interface,
                 shader_stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? &ps_compile_args : &compile_args,
                 &graphics->code[graphics->stage_count])))
             goto fail;
