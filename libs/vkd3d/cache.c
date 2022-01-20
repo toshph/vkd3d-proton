@@ -19,6 +19,7 @@
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 
 #include "vkd3d_private.h"
+#include "vkd3d_shader.h"
 
 VkResult vkd3d_create_pipeline_cache(struct d3d12_device *device,
         size_t size, const void *data, VkPipelineCache *cache)
@@ -159,6 +160,58 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 
     vr = vkd3d_create_pipeline_cache(device, chunk->size, chunk->data, cache);
     return hresult_from_vk_result(vr);
+}
+
+HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
+        struct d3d12_device *device,
+        const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
+        VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code)
+{
+    const struct vkd3d_shader_code dxbc = { code->pShaderBytecode, code->BytecodeLength };
+    const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    const struct vkd3d_pipeline_blob_chunk *spirv_chunk;
+    const struct vkd3d_pipeline_blob_chunk *meta_chunk;
+    vkd3d_shader_hash_t dxbc_hash;
+    void *duped_code;
+    HRESULT hr;
+
+    if (!state->blob.CachedBlobSizeInBytes)
+        return E_FAIL;
+
+    if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, state)))
+        return hr;
+
+    spirv_chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
+            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
+    meta_chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
+            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_META | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
+
+    if (!spirv_chunk || !meta_chunk)
+        return E_FAIL;
+
+    spirv_code->meta = *(const struct vkd3d_shader_meta *)meta_chunk->data;
+
+    /* Verify that DXBC blob hash matches with what we expect. */
+    dxbc_hash = vkd3d_shader_hash(&dxbc);
+    if (dxbc_hash != spirv_code->meta.hash)
+    {
+        WARN("DXBC blob hash in CreatePSO state (%016"PRIx64") does not match expected hash (%016"PRIx64".\n",
+                dxbc_hash, spirv_code->meta.hash);
+        return E_INVALIDARG;
+    }
+
+    /* TODO: VARINT decompress. */
+    duped_code = vkd3d_malloc(spirv_chunk->size);
+    if (!duped_code)
+        return E_FAIL;
+
+    memcpy(duped_code, spirv_chunk->data, spirv_chunk->size);
+    spirv_code->code = duped_code;
+    spirv_code->size = spirv_chunk->size;
+
+    return S_OK;
 }
 
 VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state, size_t *size, void *data)

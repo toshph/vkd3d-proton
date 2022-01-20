@@ -1654,6 +1654,10 @@ VkResult vkd3d_create_pipeline_cache(struct d3d12_device *device,
         size_t size, const void *data, VkPipelineCache *cache);
 HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state, VkPipelineCache *cache);
+HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
+        struct d3d12_device *device,
+        const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
+        VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code);
 VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state, size_t *size, void *data);
 
 struct vkd3d_buffer
