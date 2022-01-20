@@ -1450,7 +1450,7 @@ struct d3d12_graphics_pipeline_state
 {
     struct vkd3d_shader_debug_ring_spec_info spec_info[VKD3D_MAX_SHADER_STAGES];
     VkPipelineShaderStageCreateInfo stages[VKD3D_MAX_SHADER_STAGES];
-    struct vkd3d_shader_meta stage_meta[VKD3D_MAX_SHADER_STAGES];
+    struct vkd3d_shader_code code[VKD3D_MAX_SHADER_STAGES];
     size_t stage_count;
 
     VkVertexInputAttributeDescription attributes[D3D12_VS_INPUT_REGISTER_COUNT];
@@ -1503,7 +1503,7 @@ static inline unsigned int dsv_attachment_mask(const struct d3d12_graphics_pipel
 struct d3d12_compute_pipeline_state
 {
     VkPipeline vk_pipeline;
-    struct vkd3d_shader_meta meta;
+    struct vkd3d_shader_code code;
 };
 
 /* ID3D12PipelineState */
