@@ -1644,6 +1644,9 @@ struct d3d12_pipeline_library
     rwlock_t mutex;
     struct hash_map map;
 
+    size_t total_name_table_size;
+    size_t total_blob_size;
+
     struct vkd3d_private_store private_store;
 };
 

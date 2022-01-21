@@ -158,6 +158,7 @@ struct vkd3d_pipeline_blob_chunk_spirv
 STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk) == 8);
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob_chunk, data) == 8);
 
+#define VKD3D_PIPELINE_BLOB_ALIGN 8
 struct vkd3d_pipeline_blob
 {
     uint32_t version;
@@ -501,12 +502,13 @@ static bool vkd3d_cached_pipeline_compare(const void *key, const struct hash_map
             !memcmp(k->name, e->key.name, k->name_length);
 }
 
-struct vkd3d_serialized_pipeline
+struct vkd3d_serialized_pipeline_toc_entry
 {
+    uint64_t blob_offset;
     uint32_t name_length;
     uint32_t blob_length;
-    uint8_t data[];
 };
+STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_toc_entry) == 16);
 
 #define VKD3D_PIPELINE_LIBRARY_VERSION MAKE_MAGIC('V','K','L',2)
 
@@ -519,10 +521,21 @@ struct vkd3d_serialized_pipeline_library
     uint64_t vkd3d_build;
     uint64_t vkd3d_shader_interface_key;
     uint8_t cache_uuid[VK_UUID_SIZE];
-    uint8_t data[];
+    struct vkd3d_serialized_pipeline_toc_entry entries[];
 };
+/* After entries, name buffers are encoded tightly packed one after the other.
+ * For blob data, these are referenced by blob_offset / blob_length.
+ * blob_offset is aligned. */
 
-STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == offsetof(struct vkd3d_serialized_pipeline_library, data));
+/* Rationale for this split format is:
+ * - It is implied that the pipeline library can be used directly from an mmap-ed on-disk file,
+ *   since users cannot free the pointer to library once created.
+ *   In this situation, we should scan through just the TOC to begin with to avoid page faulting on potentially 100s of MBs.
+ *   It is also more cache friendly this way.
+ * - Having a more split TOC structure like this will make it easier to add SPIR-V deduplication down the line.
+ */
+
+STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == offsetof(struct vkd3d_serialized_pipeline_library, entries));
 STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == 32 + VK_UUID_SIZE);
 
 /* ID3D12PipelineLibrary */
@@ -531,30 +544,17 @@ static inline struct d3d12_pipeline_library *impl_from_ID3D12PipelineLibrary(d3d
     return CONTAINING_RECORD(iface, struct d3d12_pipeline_library, ID3D12PipelineLibrary_iface);
 }
 
-static bool d3d12_pipeline_library_serialize_entry(struct d3d12_pipeline_library *pipeline_library,
-        const struct vkd3d_cached_pipeline_entry *entry, size_t *size, void *data)
+static void d3d12_pipeline_library_serialize_entry(
+        const struct vkd3d_cached_pipeline_entry *entry,
+        struct vkd3d_serialized_pipeline_toc_entry *header,
+        uint8_t *data, size_t name_offset, size_t blob_offset)
 {
-    struct vkd3d_serialized_pipeline *header = data;
-    size_t total_size;
+    header->blob_offset = blob_offset;
+    header->name_length = entry->key.name_length;
+    header->blob_length = entry->data.blob_length;
 
-    total_size = sizeof(header) + entry->key.name_length + entry->data.blob_length;
-
-    if (header)
-    {
-        if (*size < total_size)
-        {
-            ERR("Not enough memory provided to store pipeline blob.\n");
-            return false;
-        }
-
-        header->name_length = entry->key.name_length;
-        header->blob_length = entry->data.blob_length;
-        memcpy(header->data, entry->key.name, entry->key.name_length);
-        memcpy(header->data + entry->key.name_length, entry->data.blob, entry->data.blob_length);
-    }
-
-    *size = total_size;
-    return true;
+    memcpy(data + name_offset, entry->key.name, entry->key.name_length);
+    memcpy(data + blob_offset, entry->data.blob, entry->data.blob_length);
 }
 
 static void d3d12_pipeline_library_cleanup(struct d3d12_pipeline_library *pipeline_library, struct d3d12_device *device)
@@ -732,6 +732,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     entry.data.blob = new_blob;
     entry.data.is_new = true;
 
+    pipeline_library->total_name_table_size += entry.key.name_length;
+    pipeline_library->total_blob_size += align(entry.data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
     if (!hash_map_insert(&pipeline_library->map, &entry.key, &entry.entry))
     {
         vkd3d_free(new_name);
@@ -819,11 +821,22 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_LoadComputePipeline(d3d1
             &IID_ID3D12PipelineState, iid, pipeline_state);
 }
 
+static size_t d3d12_pipeline_library_get_serialized_size(struct d3d12_pipeline_library *pipeline_library)
+{
+    size_t total_size = 0;
+
+    total_size += sizeof(struct vkd3d_serialized_pipeline_library);
+    total_size += sizeof(struct vkd3d_serialized_pipeline_toc_entry) * pipeline_library->map.used_count;
+    total_size += align(pipeline_library->total_name_table_size, VKD3D_PIPELINE_BLOB_ALIGN);
+    total_size += pipeline_library->total_blob_size;
+
+    return total_size;
+}
+
 static SIZE_T STDMETHODCALLTYPE d3d12_pipeline_library_GetSerializedSize(d3d12_pipeline_library_iface *iface)
 {
     struct d3d12_pipeline_library *pipeline_library = impl_from_ID3D12PipelineLibrary(iface);
-    size_t total_size = sizeof(struct vkd3d_serialized_pipeline_library);
-    uint32_t i;
+    size_t total_size;
     int rc;
 
     TRACE("iface %p.\n", iface);
@@ -834,20 +847,7 @@ static SIZE_T STDMETHODCALLTYPE d3d12_pipeline_library_GetSerializedSize(d3d12_p
         return 0;
     }
 
-    for (i = 0; i < pipeline_library->map.entry_count; i++)
-    {
-        struct vkd3d_cached_pipeline_entry *e = (struct vkd3d_cached_pipeline_entry*)hash_map_get_entry(&pipeline_library->map, i);
-
-        if (e->entry.flags & HASH_MAP_ENTRY_OCCUPIED)
-        {
-            size_t pipeline_size = 0;
-
-            if (!d3d12_pipeline_library_serialize_entry(pipeline_library, e, &pipeline_size, NULL))
-                return 0;
-
-            total_size += pipeline_size;
-        }
-    }
+    total_size = d3d12_pipeline_library_get_serialized_size(pipeline_library);
 
     rwlock_unlock_read(&pipeline_library->mutex);
     return total_size;
@@ -859,20 +859,27 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     struct d3d12_pipeline_library *pipeline_library = impl_from_ID3D12PipelineLibrary(iface);
     const VkPhysicalDeviceProperties *device_properties = &pipeline_library->device->device_info.properties2.properties;
     struct vkd3d_serialized_pipeline_library *header = data;
-    size_t serialized_size = data_size - sizeof(*header);
-    uint8_t *serialized_data = header->data;
+    struct vkd3d_serialized_pipeline_toc_entry *toc_entries;
+    uint8_t *serialized_data;
+    size_t required_size;
+    size_t name_offset;
+    size_t blob_offset;
     uint32_t i;
     int rc;
 
     TRACE("iface %p.\n", iface);
 
-    if (data_size < sizeof(*header))
-        return E_INVALIDARG;
-
     if ((rc = rwlock_lock_read(&pipeline_library->mutex)))
     {
         ERR("Failed to lock mutex, rc %d.\n", rc);
         return 0;
+    }
+
+    required_size = d3d12_pipeline_library_get_serialized_size(pipeline_library);
+    if (data_size < required_size)
+    {
+        rwlock_unlock_read(&pipeline_library->mutex);
+        return E_INVALIDARG;
     }
 
     header->version = VKD3D_PIPELINE_LIBRARY_VERSION;
@@ -883,23 +890,21 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     header->vkd3d_shader_interface_key = pipeline_library->device->shader_interface_key;
     memcpy(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE);
 
+    toc_entries = header->entries;
+    serialized_data = (uint8_t *)&toc_entries[pipeline_library->map.used_count];
+    name_offset = 0;
+    blob_offset = align(pipeline_library->total_name_table_size, VKD3D_PIPELINE_BLOB_ALIGN);
+
     for (i = 0; i < pipeline_library->map.entry_count; i++)
     {
         struct vkd3d_cached_pipeline_entry *e = (struct vkd3d_cached_pipeline_entry*)hash_map_get_entry(&pipeline_library->map, i);
 
         if (e->entry.flags & HASH_MAP_ENTRY_OCCUPIED)
         {
-            size_t pipeline_size = serialized_size;
-
-            /* Fails if the provided buffer is too small to fit the pipeline */
-            if (!d3d12_pipeline_library_serialize_entry(pipeline_library, e, &pipeline_size, serialized_data))
-            {
-                rwlock_unlock_read(&pipeline_library->mutex);
-                return E_INVALIDARG;
-            }
-
-            serialized_data += pipeline_size;
-            serialized_size -= pipeline_size;
+            d3d12_pipeline_library_serialize_entry(e, toc_entries, serialized_data, name_offset, blob_offset);
+            toc_entries++;
+            name_offset += e->key.name_length;
+            blob_offset += align(e->data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
         }
     }
 
@@ -958,8 +963,10 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
 {
     const VkPhysicalDeviceProperties *device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_serialized_pipeline_library *header = blob;
-    const uint8_t *end = header->data + blob_length - sizeof(*header);
-    const uint8_t *cur = header->data;
+    const uint8_t *serialized_data_base;
+    size_t serialized_data_size;
+    const uint8_t *name_table;
+    size_t header_entry_size;
     uint32_t i;
 
     /* Same logic as for pipeline blobs, indicate that the app needs
@@ -976,28 +983,41 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
             memcmp(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
+    header_entry_size = offsetof(struct vkd3d_serialized_pipeline_library, entries) +
+            header->pipeline_count * sizeof(struct vkd3d_serialized_pipeline_toc_entry);
+    if (blob_length < header_entry_size)
+        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+
+    serialized_data_size = blob_length - header_entry_size;
+    serialized_data_base = (const uint8_t *)&header->entries[header->pipeline_count];
+    name_table = serialized_data_base;
+
     /* The application is not allowed to free the blob, so we
      * can safely use pointers without copying the data first. */
     for (i = 0; i < header->pipeline_count; i++)
     {
-        const struct vkd3d_serialized_pipeline *pipeline = (const struct vkd3d_serialized_pipeline*)cur;
+        const struct vkd3d_serialized_pipeline_toc_entry *toc_entry = &header->entries[i];
         struct vkd3d_cached_pipeline_entry entry;
 
-        if (cur + sizeof(*pipeline) > end)
+        entry.key.name_length = toc_entry->name_length;
+        entry.key.name = name_table;
+
+        /* Verify that name table entry does not overflow. */
+        if (name_table + toc_entry->name_length > serialized_data_base + serialized_data_size)
             return E_INVALIDARG;
 
-        cur += sizeof(*pipeline) + pipeline->name_length + pipeline->blob_length;
+        name_table += toc_entry->name_length;
 
-        if (cur > end)
+        /* Verify that blob entry does not overflow. */
+        if (toc_entry->blob_offset + toc_entry->blob_length > serialized_data_size)
             return E_INVALIDARG;
 
-        entry.key.name_length = pipeline->name_length;
-        entry.key.name = pipeline->data;
-
-        entry.data.blob_length = pipeline->blob_length;
-        entry.data.blob = pipeline->data + pipeline->name_length;
+        entry.data.blob_length = toc_entry->blob_length;
+        entry.data.blob = serialized_data_base + toc_entry->blob_offset;
         entry.data.is_new = false;
 
+        pipeline_library->total_name_table_size += entry.key.name_length;
+        pipeline_library->total_blob_size += align(entry.data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
         if (!hash_map_insert(&pipeline_library->map, &entry.key, &entry.entry))
             return E_OUTOFMEMORY;
     }
