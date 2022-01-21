@@ -131,9 +131,12 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
     return S_OK;
 }
 
-static struct vkd3d_pipeline_blob_chunk *next_blob_chunk(struct vkd3d_pipeline_blob_chunk *chunk)
+static struct vkd3d_pipeline_blob_chunk *finish_and_iterate_blob_chunk(struct vkd3d_pipeline_blob_chunk *chunk)
 {
-    return (struct vkd3d_pipeline_blob_chunk *)&chunk->data[align(chunk->size, VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)];
+    uint32_t aligned_size = align(chunk->size, VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+    /* Ensure we get stable hashes if we need to pad. */
+    memset(&chunk->data[chunk->size], 0, aligned_size - chunk->size);
+    return (struct vkd3d_pipeline_blob_chunk *)&chunk->data[aligned_size];
 }
 
 static const struct vkd3d_pipeline_blob_chunk *find_blob_chunk(const struct vkd3d_pipeline_blob_chunk *chunk,
@@ -300,7 +303,7 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
             chunk->size = vk_blob_size_pipeline_cache;
             if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size_pipeline_cache, chunk->data))))
                 return vr;
-            chunk = next_blob_chunk(chunk);
+            chunk = finish_and_iterate_blob_chunk(chunk);
         }
 
         if (d3d12_pipeline_state_is_graphics(state))
@@ -320,7 +323,7 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
                     spirv->decompressed_spirv_size = state->graphics.code[i].size;
                     memcpy(spirv->data, state->graphics.code[i].code, state->graphics.code[i].size);
 
-                    chunk = next_blob_chunk(chunk);
+                    chunk = finish_and_iterate_blob_chunk(chunk);
                 }
             }
         }
@@ -339,7 +342,7 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
                 spirv->decompressed_spirv_size = state->compute.code.size;
                 memcpy(spirv->data, state->compute.code.code, state->compute.code.size);
 
-                chunk = next_blob_chunk(chunk);
+                chunk = finish_and_iterate_blob_chunk(chunk);
             }
         }
 
