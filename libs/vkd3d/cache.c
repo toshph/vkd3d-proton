@@ -21,6 +21,95 @@
 #include "vkd3d_private.h"
 #include "vkd3d_shader.h"
 
+static size_t vkd3d_compute_size_varint(const uint32_t *words, size_t word_count)
+{
+    size_t size = 0;
+    uint32_t w;
+    size_t i;
+
+    for (i = 0; i < word_count; i++)
+    {
+        w = words[i];
+        if (w < (1u << 7))
+            size += 1;
+        else if (w < (1u << 14))
+            size += 2;
+        else if (w < (1u << 21))
+            size += 3;
+        else if (w < (1u << 28))
+            size += 4;
+        else
+            size += 5;
+    }
+    return size;
+}
+
+static uint8_t *vkd3d_encode_varint(uint8_t *buffer, const uint32_t *words, size_t word_count)
+{
+    uint32_t w;
+    size_t i;
+    for (i = 0; i < word_count; i++)
+    {
+        w = words[i];
+        if (w < (1u << 7))
+            *buffer++ = w;
+        else if (w < (1u << 14))
+        {
+            *buffer++ = 0x80u | ((w >> 0) & 0x7f);
+            *buffer++ = (w >> 7) & 0x7f;
+        }
+        else if (w < (1u << 21))
+        {
+            *buffer++ = 0x80u | ((w >> 0) & 0x7f);
+            *buffer++ = 0x80u | ((w >> 7) & 0x7f);
+            *buffer++ = (w >> 14) & 0x7f;
+        }
+        else if (w < (1u << 28))
+        {
+            *buffer++ = 0x80u | ((w >> 0) & 0x7f);
+            *buffer++ = 0x80u | ((w >> 7) & 0x7f);
+            *buffer++ = 0x80u | ((w >> 14) & 0x7f);
+            *buffer++ = (w >> 21) & 0x7f;
+        }
+        else
+        {
+            *buffer++ = 0x80u | ((w >> 0) & 0x7f);
+            *buffer++ = 0x80u | ((w >> 7) & 0x7f);
+            *buffer++ = 0x80u | ((w >> 14) & 0x7f);
+            *buffer++ = 0x80u | ((w >> 21) & 0x7f);
+            *buffer++ = (w >> 28) & 0x7f;
+        }
+    }
+
+    return buffer;
+}
+
+static bool vkd3d_decode_varint(uint32_t *words, size_t words_size, const uint8_t *buffer, size_t buffer_size)
+{
+    size_t offset = 0;
+    uint32_t shift;
+    uint32_t *w;
+    size_t i;
+
+    for (i = 0; i < words_size; i++)
+    {
+        w = &words[i];
+        *w = 0;
+
+        shift = 0;
+        do
+        {
+            if (offset >= buffer_size || shift >= 32u)
+                return false;
+
+            *w |= (buffer[offset] & 0x7f) << shift;
+            shift += 7;
+        } while (buffer[offset++] & 0x80);
+    }
+
+    return buffer_size == offset;
+}
+
 VkResult vkd3d_create_pipeline_cache(struct d3d12_device *device,
         size_t size, const void *data, VkPipelineCache *cache)
 {
@@ -221,12 +310,19 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         return E_INVALIDARG;
     }
 
-    /* TODO: VARINT decompress. */
     duped_code = vkd3d_malloc(spirv->decompressed_spirv_size);
     if (!duped_code)
         return E_OUTOFMEMORY;
 
-    memcpy(duped_code, spirv->data, spirv->decompressed_spirv_size);
+    if (!vkd3d_decode_varint(duped_code,
+            spirv->decompressed_spirv_size / sizeof(uint32_t),
+            spirv->data, spirv->compressed_spirv_size))
+    {
+        FIXME("Failed to decode VARINT.\n");
+        vkd3d_free(duped_code);
+        return E_INVALIDARG;
+    }
+
     spirv_code->code = duped_code;
     spirv_code->size = spirv->decompressed_spirv_size;
 
@@ -238,6 +334,7 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
     const VkPhysicalDeviceProperties *device_properties = &state->device->device_info.properties2.properties;
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
     struct vkd3d_pipeline_blob_chunk_spirv *spirv;
+    size_t varint_size[VKD3D_MAX_SHADER_STAGES];
     struct vkd3d_pipeline_blob *blob = data;
     struct vkd3d_pipeline_blob_chunk *chunk;
     size_t vk_blob_size_pipeline_cache = 0;
@@ -259,15 +356,16 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
     }
 
     /* TODO: We might want to only store references to a de-duped SPIR-V pool here. */
-    /* TODO: Compress SPIR-V. */
     if (d3d12_pipeline_state_is_graphics(state))
     {
         for (i = 0; i < state->graphics.stage_count; i++)
         {
             if (state->graphics.code[i].size)
             {
+                varint_size[i] = vkd3d_compute_size_varint(state->graphics.code[i].code,
+                        state->graphics.code[i].size / sizeof(uint32_t));
                 vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                                sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->graphics.code[i].size,
+                                sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[i],
                         VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
             }
         }
@@ -276,8 +374,10 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
     {
         if (state->compute.code.size)
         {
+            varint_size[0] = vkd3d_compute_size_varint(state->compute.code.code,
+                    state->compute.code.size / sizeof(uint32_t));
             vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                            sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->compute.code.size,
+                            sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[0],
                     VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
         }
     }
@@ -314,14 +414,15 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
                 {
                     chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
                             (state->graphics.stages[i].stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
-                    chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->graphics.code[i].size;
+                    chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[i];
 
                     spirv = (struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
                     spirv->meta = state->graphics.code[i].meta;
-                    /* TODO: For VARINT, we can scan this easily. */
-                    spirv->compressed_spirv_size = state->graphics.code[i].size;
+                    spirv->compressed_spirv_size = varint_size[i];
                     spirv->decompressed_spirv_size = state->graphics.code[i].size;
-                    memcpy(spirv->data, state->graphics.code[i].code, state->graphics.code[i].size);
+
+                    vkd3d_encode_varint(spirv->data, state->graphics.code[i].code,
+                            state->graphics.code[i].size / sizeof(uint32_t));
 
                     chunk = finish_and_iterate_blob_chunk(chunk);
                 }
@@ -333,14 +434,15 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
             {
                 chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
                         (VK_SHADER_STAGE_COMPUTE_BIT << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
-                chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->compute.code.size;
+                chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[0];
 
                 spirv = (struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
                 spirv->meta = state->compute.code.meta;
-                /* TODO: For VARINT, we can scan this easily. */
-                spirv->compressed_spirv_size = state->compute.code.size;
+                spirv->compressed_spirv_size = varint_size[0];
                 spirv->decompressed_spirv_size = state->compute.code.size;
-                memcpy(spirv->data, state->compute.code.code, state->compute.code.size);
+
+                vkd3d_encode_varint(spirv->data, state->compute.code.code,
+                        state->compute.code.size / sizeof(uint32_t));
 
                 chunk = finish_and_iterate_blob_chunk(chunk);
             }
