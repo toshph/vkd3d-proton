@@ -149,6 +149,7 @@ struct vkd3d_pipeline_blob_chunk
 
 struct vkd3d_pipeline_blob_chunk_spirv
 {
+    uint64_t root_signature_compat_hash;
     struct vkd3d_shader_meta meta;
     uint32_t decompressed_spirv_size;
     uint32_t compressed_spirv_size;
@@ -157,6 +158,8 @@ struct vkd3d_pipeline_blob_chunk_spirv
 
 STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk) == 8);
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob_chunk, data) == 8);
+STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk_spirv) == 16 + sizeof(struct vkd3d_shader_meta));
+STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk_spirv) == offsetof(struct vkd3d_pipeline_blob_chunk_spirv, data));
 
 #define VKD3D_PIPELINE_BLOB_ALIGN 8
 struct vkd3d_pipeline_blob
@@ -279,7 +282,9 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 
 HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
-        VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code)
+        VkShaderStageFlagBits stage,
+        vkd3d_shader_hash_t root_signature_compat_hash,
+        struct vkd3d_shader_code *spirv_code)
 {
     const struct vkd3d_shader_code dxbc = { code->pShaderBytecode, code->BytecodeLength };
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
@@ -301,6 +306,13 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     spirv = (const struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
 
     spirv_code->meta = spirv->meta;
+
+    /* Verify the expected root signature that was used to generate the SPIR-V. */
+    if (root_signature_compat_hash != spirv->root_signature_compat_hash)
+    {
+        WARN("Root signature compatibility hash mismatch.\n");
+        return E_INVALIDARG;
+    }
 
     /* Verify that DXBC blob hash matches with what we expect. */
     dxbc_hash = vkd3d_shader_hash(&dxbc);
@@ -421,6 +433,7 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
                     spirv->meta = state->graphics.code[i].meta;
                     spirv->compressed_spirv_size = varint_size[i];
                     spirv->decompressed_spirv_size = state->graphics.code[i].size;
+                    spirv->root_signature_compat_hash = state->root_signature_compat_hash;
 
                     vkd3d_encode_varint(spirv->data, state->graphics.code[i].code,
                             state->graphics.code[i].size / sizeof(uint32_t));
@@ -441,6 +454,7 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
                 spirv->meta = state->compute.code.meta;
                 spirv->compressed_spirv_size = varint_size[0];
                 spirv->decompressed_spirv_size = state->compute.code.size;
+                spirv->root_signature_compat_hash = state->root_signature_compat_hash;
 
                 vkd3d_encode_varint(spirv->data, state->compute.code.code,
                         state->compute.code.size / sizeof(uint32_t));

@@ -1472,6 +1472,11 @@ HRESULT d3d12_root_signature_create(struct d3d12_device *device,
     }
 
     hr = d3d12_root_signature_init(object, device, &root_signature_desc.d3d12.Desc_1_1);
+
+    /* For pipeline libraries, (and later DXR to some degree), we need a way to
+     * compare root signature objects. */
+    object->compatibility_hash = vkd3d_shader_hash(&dxbc);
+
     vkd3d_shader_free_root_signature(&root_signature_desc.vkd3d);
     if (FAILED(hr))
     {
@@ -2271,6 +2276,7 @@ CONST_VTBL struct ID3D12PipelineStateVtbl d3d12_pipeline_state_vtbl =
 };
 
 static HRESULT create_shader_stage(struct d3d12_device *device,
+        vkd3d_shader_hash_t root_signature_compat_hash,
         VkPipelineShaderStageCreateInfo *stage_desc, VkShaderStageFlagBits stage,
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *required_subgroup_size_info,
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *cached_state,
@@ -2290,7 +2296,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
 
-    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
+    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, root_signature_compat_hash, spirv_code);
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
         if (SUCCEEDED(hr))
@@ -2305,10 +2311,10 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
             else
                 INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
         }
+        else if (hr == E_INVALIDARG)
+            INFO("Pipeline could not be created to mismatch in either root signature or DXBC blobs.\n");
         else
-        {
             INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
-        }
     }
 
     /* For debug/dev purposes, it's useful to force compilation even if we have SPIR-V in cache. */
@@ -2340,7 +2346,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
         if (compiled_hash == recovered_hash)
             INFO("SPIR-V match for cache reference OK!\n");
         else
-            FIXME("SPIR-V mismatch for cache reference!\n");
+            INFO("SPIR-V mismatch for cache reference!\n");
     }
 
     if (!d3d12_device_validate_shader_meta(device, &spirv_code->meta))
@@ -2394,6 +2400,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
 }
 
 static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
+        vkd3d_shader_hash_t root_signature_compat_hash,
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *cached_state,
         const struct vkd3d_shader_interface_info *shader_interface,
         VkPipelineLayout vk_pipeline_layout, VkPipelineCache vk_cache, VkPipeline *vk_pipeline,
@@ -2416,7 +2423,8 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.pNext = NULL;
     pipeline_info.flags = 0;
-    if (FAILED(hr = create_shader_stage(device, &pipeline_info.stage,
+    if (FAILED(hr = create_shader_stage(device, root_signature_compat_hash,
+            &pipeline_info.stage,
             VK_SHADER_STAGE_COMPUTE_BIT, &required_subgroup_size_info,
             code, cached_state, shader_interface, &compile_args, spirv_code)))
         return hr;
@@ -2487,7 +2495,8 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
         }
     }
 
-    hr = vkd3d_create_compute_pipeline(device, &desc->cs, &desc->cached_pso, &shader_interface,
+    hr = vkd3d_create_compute_pipeline(device, state->root_signature_compat_hash,
+            &desc->cs, &desc->cached_pso, &shader_interface,
             root_signature->compute.vk_pipeline_layout,
             state->vk_pso_cache ? state->vk_pso_cache : device->global_pipeline_cache,
             &state->compute.vk_pipeline,
@@ -3567,7 +3576,8 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
 
         shader_interface.xfb_info = shader_stages[i].stage == xfb_stage ? &xfb_info : NULL;
         shader_interface.stage = shader_stages[i].stage;
-        if (FAILED(hr = create_shader_stage(device, &graphics->stages[graphics->stage_count],
+        if (FAILED(hr = create_shader_stage(device, state->root_signature_compat_hash,
+                &graphics->stages[graphics->stage_count],
                 shader_stages[i].stage, NULL, b, &desc->cached_pso, &shader_interface,
                 shader_stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? &ps_compile_args : &compile_args,
                 &graphics->code[graphics->stage_count])))
@@ -3882,6 +3892,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    struct d3d12_root_signature *root_signature;
     struct d3d12_pipeline_state *object;
     HRESULT hr;
 
@@ -3903,7 +3914,13 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
             vkd3d_free(object);
             return hr;
         }
+        root_signature = impl_from_ID3D12RootSignature(object->private_root_signature);
     }
+    else
+        root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
+
+    if (root_signature)
+        object->root_signature_compat_hash = root_signature->compatibility_hash;
 
     switch (bind_point)
     {

@@ -1308,6 +1308,8 @@ struct d3d12_root_signature
     ID3D12RootSignature ID3D12RootSignature_iface;
     LONG refcount;
 
+    vkd3d_shader_hash_t compatibility_hash;
+
     struct d3d12_bind_point_layout graphics, compute, raygen;
     VkDescriptorSetLayout vk_sampler_descriptor_layout;
     VkDescriptorSetLayout vk_root_descriptor_layout;
@@ -1521,6 +1523,7 @@ struct d3d12_pipeline_state
     VkPipelineCache vk_pso_cache;
     spinlock_t lock;
 
+    vkd3d_shader_hash_t root_signature_compat_hash;
     ID3D12RootSignature *private_root_signature;
     struct d3d12_device *device;
 
@@ -1659,7 +1662,9 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state, VkPipelineCache *cache);
 HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
-        VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code);
+        VkShaderStageFlagBits stage,
+        vkd3d_shader_hash_t root_signature_compat_hash,
+        struct vkd3d_shader_code *spirv_code);
 VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state, size_t *size, void *data);
 HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state);
