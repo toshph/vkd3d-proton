@@ -3913,13 +3913,20 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         return hr;
     }
 
-    /* TODO: For later, we'd like to either free SPIR-V code or free modules depending
-     * on our pipeline caching strategy. If we want to be able to store SPIR-V modules
-     * to a pipeline library, we should keep the SPIR-V data alive as plain blob.
-     * VkShaderModules can then be created on-demand if we are forced to recompile pipelines (should be very rare
-     * now with dynamic state being required).
-     * Alternatively, we can just keep it as VkShaderModule if we never intend to store SPIR-V binaries. */
-    d3d12_pipeline_state_free_spirv_code(object);
+    /* The strategy here is that we need to keep the SPIR-V alive somehow.
+     * If we don't need to serialize SPIR-V from the PSO, then we don't need to keep the code alive as pointer/size pairs.
+     * The scenarios for this case is when we choose to not serialize SPIR-V at all with VKD3D_CONFIG,
+     * or the PSO was loaded from a cached blob. It's extremely unlikely that anyone is going to try
+     * serializing that PSO again, so there should be no need to keep it alive.
+     * The worst that would happen is a performance loss should that entry be reloaded later.
+     * For graphics pipelines, we have to keep VkShaderModules around in case we need fallback pipelines.
+     * If we keep the SPIR-V around in memory, we can always create shader modules on-demand in case we
+     * need to actually create fallback pipelines. This avoids unnecessary memory bloat. */
+    if (desc->cached_pso.CachedBlobSizeInBytes ||
+            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
+        d3d12_pipeline_state_free_spirv_code(object);
+    else
+        d3d12_pipeline_state_destroy_shader_modules(object, device);
 
     TRACE("Created pipeline state %p.\n", object);
 
@@ -4097,6 +4104,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     VkDynamicState dynamic_state_buffer[VKD3D_MAX_DYNAMIC_STATE_COUNT];
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
     VkPipelineVertexInputDivisorStateCreateInfoEXT input_divisor_info;
+    VkPipelineShaderStageCreateInfo stages[VKD3D_MAX_SHADER_STAGES];
     VkPipelineTessellationStateCreateInfo tessellation_info;
     VkPipelineDepthStencilStateCreateInfo fallback_ds_desc;
     VkPipelineDynamicStateCreateInfo dynamic_create_info;
@@ -4217,6 +4225,28 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     /* Any of these is fine from a compatibility PoV. */
     pipeline_desc.renderPass = render_pass_compat->dsv_layouts[0];
 
+    if (key)
+    {
+        /* In a fallback pipeline, we might have to re-create shader modules.
+         * This can happen from multiple threads, so need temporary pStages array. */
+        memcpy(stages, graphics->stages, graphics->stage_count * sizeof(stages[0]));
+
+        for (i = 0; i < graphics->stage_count; i++)
+        {
+            if (stages[i].module == VK_NULL_HANDLE && graphics->code[i].code)
+            {
+                if (FAILED(hr = d3d12_pipeline_state_create_shader_module(device, &stages[i], &graphics->code[i])))
+                {
+                    /* This is kind of fatal and should only happen for out-of-memory. */
+                    ERR("Unexpected failure (hr %x) in creating fallback SPIR-V module.\n", hr);
+                    return VK_NULL_HANDLE;
+                }
+
+                pipeline_desc.pStages = stages;
+            }
+        }
+    }
+
     TRACE("Calling vkCreateGraphicsPipelines.\n");
     if ((vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device,
             vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline))) < 0)
@@ -4225,6 +4255,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         return VK_NULL_HANDLE;
     }
     TRACE("Completed vkCreateGraphicsPipelines.\n");
+
+    /* Clean up any temporary SPIR-V modules we created. */
+    if (pipeline_desc.pStages == stages)
+        for (i = 0; i < graphics->stage_count; i++)
+            if (stages[i].module != graphics->stages[i].module)
+                VK_CALL(vkDestroyShaderModule(device->vk_device, stages[i].module, NULL));
 
     return vk_pipeline;
 }
