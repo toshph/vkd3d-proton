@@ -2278,6 +2278,8 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
         const struct vkd3d_shader_compile_arguments *compile_args, struct vkd3d_shader_code *spirv_code)
 {
     struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
+    vkd3d_shader_hash_t recovered_hash = 0;
+    vkd3d_shader_hash_t compiled_hash = 0;
     HRESULT hr;
     int ret;
 
@@ -2288,33 +2290,36 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
 
+    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+    {
+        if (SUCCEEDED(hr))
+        {
+            INFO("SPIR-V (stage: %x) for blob hash %016"PRIx64" received from cached pipeline state.\n",
+                    stage, spirv_code->meta.hash);
+        }
+        else if (hr == E_FAIL)
+        {
+            if (cached_state->blob.CachedBlobSizeInBytes)
+                INFO("SPIR-V chunk was not found in cached PSO state.\n");
+            else
+                INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
+        }
+        else
+        {
+            INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
+        }
+    }
+
     /* For debug/dev purposes, it's useful to force compilation even if we have SPIR-V in cache. */
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_UNSERIALIZE_SPIRV)
     {
-        hr = E_FAIL;
-    }
-    else
-    {
-        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
-        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+        if (SUCCEEDED(hr))
         {
-            if (SUCCEEDED(hr))
-            {
-                INFO("SPIR-V (stage: %x) for blob hash %016"PRIx64" received from cached pipeline state.\n",
-                        stage, spirv_code->meta.hash);
-            }
-            else if (hr == E_FAIL)
-            {
-                if (cached_state->blob.CachedBlobSizeInBytes)
-                    INFO("SPIR-V chunk was not found in cached PSO state.\n");
-                else
-                    INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
-            }
-            else
-            {
-                INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
-            }
+            recovered_hash = vkd3d_shader_hash(spirv_code);
+            vkd3d_shader_free_shader_code(spirv_code);
         }
+        hr = E_FAIL;
     }
 
     if (FAILED(hr))
@@ -2326,6 +2331,16 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
             return hresult_from_vkd3d_result(ret);
         }
         TRACE("Called vkd3d_shader_compile_dxbc.\n");
+    }
+
+    /* Debug compare SPIR-V we got from cache, and SPIR-V we got from compilation. */
+    if (recovered_hash)
+    {
+        compiled_hash = vkd3d_shader_hash(spirv_code);
+        if (compiled_hash == recovered_hash)
+            INFO("SPIR-V match for cache reference OK!\n");
+        else
+            FIXME("SPIR-V mismatch for cache reference!\n");
     }
 
     if (!d3d12_device_validate_shader_meta(device, &spirv_code->meta))
