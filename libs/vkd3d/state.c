@@ -2295,7 +2295,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     }
     else
     {
-        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(device, code, cached_state, stage, spirv_code);
+        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
         if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
         {
             if (SUCCEEDED(hr))
@@ -2305,7 +2305,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
             }
             else if (hr == E_FAIL)
             {
-                if (cached_state->CachedBlobSizeInBytes)
+                if (cached_state->blob.CachedBlobSizeInBytes)
                     INFO("SPIR-V chunk was not found in cached PSO state.\n");
                 else
                     INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
@@ -3870,6 +3870,10 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     struct d3d12_pipeline_state *object;
     HRESULT hr;
 
+    if (desc->cached_pso.blob.CachedBlobSizeInBytes)
+        if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, &desc->cached_pso)))
+            return hr;
+
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
@@ -3922,7 +3926,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
      * For graphics pipelines, we have to keep VkShaderModules around in case we need fallback pipelines.
      * If we keep the SPIR-V around in memory, we can always create shader modules on-demand in case we
      * need to actually create fallback pipelines. This avoids unnecessary memory bloat. */
-    if (desc->cached_pso.CachedBlobSizeInBytes ||
+    if (desc->cached_pso.blob.CachedBlobSizeInBytes ||
             (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
         d3d12_pipeline_state_free_spirv_code(object);
     else

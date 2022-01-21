@@ -74,7 +74,7 @@ struct vkd3d_pipeline_blob
     uint32_t version;
     uint32_t vendor_id;
     uint32_t device_id;
-    uint32_t padding;
+    uint32_t checksum; /* Simple checksum for data[] as a sanity check. uint32_t because it conveniently packs here. */
     uint64_t vkd3d_build;
     uint64_t vkd3d_shader_interface_key;
     uint8_t cache_uuid[VK_UUID_SIZE];
@@ -84,11 +84,22 @@ struct vkd3d_pipeline_blob
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == (32 + VK_UUID_SIZE));
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == sizeof(struct vkd3d_pipeline_blob));
 
-static HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+static uint32_t vkd3d_pipeline_blob_compute_data_checksum(const uint8_t *data, size_t size)
+{
+    uint64_t h = hash_fnv1_init();
+    size_t i;
+
+    for (i = 0; i < size; i++)
+        h = hash_fnv1_iterate_u8(h, data[i]);
+    return hash_uint64(h);
+}
+
+HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state)
 {
     const VkPhysicalDeviceProperties *device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    uint32_t checksum;
 
     /* Avoid E_INVALIDARG with an invalid header size, since that may confuse some games */
     if (state->blob.CachedBlobSizeInBytes < sizeof(*blob) || blob->version != VKD3D_CACHE_BLOB_VERSION)
@@ -106,6 +117,16 @@ static HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
             blob->vkd3d_shader_interface_key != device->shader_interface_key ||
             memcmp(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+
+    checksum = vkd3d_pipeline_blob_compute_data_checksum(blob->data,
+            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data));
+
+    if (checksum != blob->checksum)
+    {
+        ERR("Corrupt PSO cache blob entry found!\n");
+        /* Same rationale as above, avoid E_INVALIDARG, since that may confuse some games */
+        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
 
     return S_OK;
 }
@@ -142,16 +163,12 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
     const struct vkd3d_pipeline_blob_chunk *chunk;
     VkResult vr;
-    HRESULT hr;
 
     if (!state->blob.CachedBlobSizeInBytes)
     {
         vr = vkd3d_create_pipeline_cache(device, 0, NULL, cache);
         return hresult_from_vk_result(vr);
     }
-
-    if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, state)))
-        return hr;
 
     chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
             state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
@@ -168,7 +185,6 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 }
 
 HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
-        struct d3d12_device *device,
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
         VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code)
 {
@@ -178,13 +194,9 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     const struct vkd3d_pipeline_blob_chunk *chunk;
     vkd3d_shader_hash_t dxbc_hash;
     void *duped_code;
-    HRESULT hr;
 
     if (!state->blob.CachedBlobSizeInBytes)
         return E_FAIL;
-
-    if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, state)))
-        return hr;
 
     chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
             state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
@@ -277,7 +289,6 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
         blob->version = VKD3D_CACHE_BLOB_VERSION;
         blob->vendor_id = device_properties->vendorID;
         blob->device_id = device_properties->deviceID;
-        blob->padding = 0;
         blob->vkd3d_shader_interface_key = state->device->shader_interface_key;
         blob->vkd3d_build = vkd3d_build;
         memcpy(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE);
@@ -331,6 +342,8 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
                 chunk = next_blob_chunk(chunk);
             }
         }
+
+        blob->checksum = vkd3d_pipeline_blob_compute_data_checksum(blob->data, vk_blob_size);
     }
 
     *size = total_size;
