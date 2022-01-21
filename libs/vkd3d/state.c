@@ -2273,7 +2273,7 @@ CONST_VTBL struct ID3D12PipelineStateVtbl d3d12_pipeline_state_vtbl =
 static HRESULT create_shader_stage(struct d3d12_device *device,
         VkPipelineShaderStageCreateInfo *stage_desc, VkShaderStageFlagBits stage,
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *required_subgroup_size_info,
-        const D3D12_SHADER_BYTECODE *code, const D3D12_CACHED_PIPELINE_STATE *cached_state,
+        const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *cached_state,
         const struct vkd3d_shader_interface_info *shader_interface,
         const struct vkd3d_shader_compile_arguments *compile_args, struct vkd3d_shader_code *spirv_code)
 {
@@ -2354,7 +2354,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
 }
 
 static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
-        const D3D12_SHADER_BYTECODE *code, const D3D12_CACHED_PIPELINE_STATE *cached_state,
+        const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *cached_state,
         const struct vkd3d_shader_interface_info *shader_interface,
         VkPipelineLayout vk_pipeline_layout, VkPipelineCache vk_cache, VkPipeline *vk_pipeline,
         struct vkd3d_shader_code *spirv_code)

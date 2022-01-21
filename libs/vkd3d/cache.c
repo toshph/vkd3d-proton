@@ -45,9 +45,6 @@ enum vkd3d_pipeline_blob_chunk_type
     /* VkShaderStage is stored in upper 16 bits. */
     /* TODO: We might want to deduplicate the SPIR-V through some extra indirection. */
     VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV = 1,
-    /* Metadata we should have obtained from vkd3d-shader. It is sometimes needed when creating a PSO.
-     * VkShaderStage is stored in upper 16 bits. */
-    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_META = 2,
     /* TODO: We can expand this as needed if we get a way to not have to store raw SPIR-V. */
     VKD3D_PIPELINE_BLOB_CHUNK_TYPE_MASK = 0xffff,
     VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT = 16,
@@ -58,6 +55,14 @@ struct vkd3d_pipeline_blob_chunk
 {
     uint32_t type; /* vkd3d_pipeline_blob_chunk_type with extra data in upper bits. */
     uint32_t size; /* size of data. Does not include size of header. */
+    uint8_t data[];
+};
+
+struct vkd3d_pipeline_blob_chunk_spirv
+{
+    struct vkd3d_shader_meta meta;
+    uint32_t decompressed_spirv_size;
+    uint32_t compressed_spirv_size;
     uint8_t data[];
 };
 
@@ -169,8 +174,8 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
 {
     const struct vkd3d_shader_code dxbc = { code->pShaderBytecode, code->BytecodeLength };
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
-    const struct vkd3d_pipeline_blob_chunk *spirv_chunk;
-    const struct vkd3d_pipeline_blob_chunk *meta_chunk;
+    const struct vkd3d_pipeline_blob_chunk_spirv *spirv;
+    const struct vkd3d_pipeline_blob_chunk *chunk;
     vkd3d_shader_hash_t dxbc_hash;
     void *duped_code;
     HRESULT hr;
@@ -181,17 +186,16 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, state)))
         return hr;
 
-    spirv_chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
             state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
             VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
-    meta_chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
-            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
-            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_META | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
 
-    if (!spirv_chunk || !meta_chunk)
+    if (!chunk)
         return E_FAIL;
 
-    spirv_code->meta = *(const struct vkd3d_shader_meta *)meta_chunk->data;
+    spirv = (const struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
+
+    spirv_code->meta = spirv->meta;
 
     /* Verify that DXBC blob hash matches with what we expect. */
     dxbc_hash = vkd3d_shader_hash(&dxbc);
@@ -203,13 +207,13 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     }
 
     /* TODO: VARINT decompress. */
-    duped_code = vkd3d_malloc(spirv_chunk->size);
+    duped_code = vkd3d_malloc(spirv->decompressed_spirv_size);
     if (!duped_code)
-        return E_FAIL;
+        return E_OUTOFMEMORY;
 
-    memcpy(duped_code, spirv_chunk->data, spirv_chunk->size);
+    memcpy(duped_code, spirv->data, spirv->decompressed_spirv_size);
     spirv_code->code = duped_code;
-    spirv_code->size = spirv_chunk->size;
+    spirv_code->size = spirv->decompressed_spirv_size;
 
     return S_OK;
 }
@@ -218,11 +222,13 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
 {
     const VkPhysicalDeviceProperties *device_properties = &state->device->device_info.properties2.properties;
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
+    struct vkd3d_pipeline_blob_chunk_spirv *spirv;
     struct vkd3d_pipeline_blob *blob = data;
     struct vkd3d_pipeline_blob_chunk *chunk;
     size_t vk_blob_size_pipeline_cache = 0;
     size_t total_size = sizeof(*blob);
     size_t vk_blob_size = 0;
+    unsigned int i;
     VkResult vr;
 
     if (state->vk_pso_cache)
@@ -235,8 +241,30 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
 
         vk_blob_size += align(vk_blob_size_pipeline_cache + sizeof(struct vkd3d_pipeline_blob_chunk),
                 VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+    }
 
-        /* TODO: If configured for it, also serialize out SPIR-V. */
+    /* TODO: We might want to only store references to a de-duped SPIR-V pool here. */
+    /* TODO: Compress SPIR-V. */
+    if (d3d12_pipeline_state_is_graphics(state))
+    {
+        for (i = 0; i < state->graphics.stage_count; i++)
+        {
+            if (state->graphics.code[i].size)
+            {
+                vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                                sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->graphics.code[i].size,
+                        VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+            }
+        }
+    }
+    else if (d3d12_pipeline_state_is_compute(state))
+    {
+        if (state->compute.code.size)
+        {
+            vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                            sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->compute.code.size,
+                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        }
     }
 
     total_size += vk_blob_size;
@@ -264,7 +292,45 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
             chunk = next_blob_chunk(chunk);
         }
 
-        /* TODO: If configured for it, also serialize out SPIR-V. */
+        if (d3d12_pipeline_state_is_graphics(state))
+        {
+            for (i = 0; i < state->graphics.stage_count; i++)
+            {
+                if (state->graphics.code[i].size)
+                {
+                    chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
+                            (state->graphics.stages[i].stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
+                    chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->graphics.code[i].size;
+
+                    spirv = (struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
+                    spirv->meta = state->graphics.code[i].meta;
+                    /* TODO: For VARINT, we can scan this easily. */
+                    spirv->compressed_spirv_size = state->graphics.code[i].size;
+                    spirv->decompressed_spirv_size = state->graphics.code[i].size;
+                    memcpy(spirv->data, state->graphics.code[i].code, state->graphics.code[i].size);
+
+                    chunk = next_blob_chunk(chunk);
+                }
+            }
+        }
+        else if (d3d12_pipeline_state_is_compute(state))
+        {
+            if (state->compute.code.size)
+            {
+                chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
+                        (VK_SHADER_STAGE_COMPUTE_BIT << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
+                chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + state->compute.code.size;
+
+                spirv = (struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
+                spirv->meta = state->compute.code.meta;
+                /* TODO: For VARINT, we can scan this easily. */
+                spirv->compressed_spirv_size = state->compute.code.size;
+                spirv->decompressed_spirv_size = state->compute.code.size;
+                memcpy(spirv->data, state->compute.code.code, state->compute.code.size);
+
+                chunk = next_blob_chunk(chunk);
+            }
+        }
     }
 
     *size = total_size;
