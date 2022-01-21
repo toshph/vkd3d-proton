@@ -2288,11 +2288,36 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
 
-    if (SUCCEEDED(hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(device, code, cached_state, stage, spirv_code)))
+    /* For debug/dev purposes, it's useful to force compilation even if we have SPIR-V in cache. */
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_UNSERIALIZE_SPIRV)
     {
-        TRACE("SPIR-V for blob hash %016"PRIx64" received from cached pipeline state.\n", spirv_code->meta.hash);
+        hr = E_FAIL;
     }
     else
+    {
+        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(device, code, cached_state, stage, spirv_code);
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+        {
+            if (SUCCEEDED(hr))
+            {
+                INFO("SPIR-V (stage: %x) for blob hash %016"PRIx64" received from cached pipeline state.\n",
+                        stage, spirv_code->meta.hash);
+            }
+            else if (hr == E_FAIL)
+            {
+                if (cached_state->CachedBlobSizeInBytes)
+                    INFO("SPIR-V chunk was not found in cached PSO state.\n");
+                else
+                    INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
+            }
+            else
+            {
+                INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
+            }
+        }
+    }
+
+    if (FAILED(hr))
     {
         TRACE("Calling vkd3d_shader_compile_dxbc.\n");
         if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, 0, shader_interface, compile_args)) < 0)
