@@ -2235,13 +2235,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_state_GetCachedBlob(ID3D12Pipeli
 
     TRACE("iface %p, blob %p.\n", iface, blob);
 
-    if ((vr = vkd3d_serialize_pipeline_state(state, &cache_size, NULL)))
+    if ((vr = vkd3d_serialize_pipeline_state(NULL, state, &cache_size, NULL)))
         return hresult_from_vk_result(vr);
 
     if (!(cache_data = malloc(cache_size)))
         return E_OUTOFMEMORY;
 
-    if ((vr = vkd3d_serialize_pipeline_state(state, &cache_size, cache_data)))
+    if ((vr = vkd3d_serialize_pipeline_state(NULL, state, &cache_size, cache_data)))
     {
         vkd3d_free(cache_data);
         return hresult_from_vk_result(vr);
@@ -2276,7 +2276,6 @@ CONST_VTBL struct ID3D12PipelineStateVtbl d3d12_pipeline_state_vtbl =
 };
 
 static HRESULT create_shader_stage(struct d3d12_device *device,
-        vkd3d_shader_hash_t root_signature_compat_hash,
         VkPipelineShaderStageCreateInfo *stage_desc, VkShaderStageFlagBits stage,
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *required_subgroup_size_info,
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *cached_state,
@@ -2296,7 +2295,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
 
-    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, root_signature_compat_hash, spirv_code);
+    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
         if (SUCCEEDED(hr))
@@ -2400,7 +2399,6 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
 }
 
 static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
-        vkd3d_shader_hash_t root_signature_compat_hash,
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *cached_state,
         const struct vkd3d_shader_interface_info *shader_interface,
         VkPipelineLayout vk_pipeline_layout, VkPipelineCache vk_cache, VkPipeline *vk_pipeline,
@@ -2423,7 +2421,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.pNext = NULL;
     pipeline_info.flags = 0;
-    if (FAILED(hr = create_shader_stage(device, root_signature_compat_hash,
+    if (FAILED(hr = create_shader_stage(device,
             &pipeline_info.stage,
             VK_SHADER_STAGE_COMPUTE_BIT, &required_subgroup_size_info,
             code, cached_state, shader_interface, &compile_args, spirv_code)))
@@ -2495,7 +2493,7 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
         }
     }
 
-    hr = vkd3d_create_compute_pipeline(device, state->root_signature_compat_hash,
+    hr = vkd3d_create_compute_pipeline(device,
             &desc->cs, &desc->cached_pso, &shader_interface,
             root_signature->compute.vk_pipeline_layout,
             state->vk_pso_cache ? state->vk_pso_cache : device->global_pipeline_cache,
@@ -3576,7 +3574,7 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
 
         shader_interface.xfb_info = shader_stages[i].stage == xfb_stage ? &xfb_info : NULL;
         shader_interface.stage = shader_stages[i].stage;
-        if (FAILED(hr = create_shader_stage(device, state->root_signature_compat_hash,
+        if (FAILED(hr = create_shader_stage(device,
                 &graphics->stages[graphics->stage_count],
                 shader_stages[i].stage, NULL, b, &desc->cached_pso, &shader_interface,
                 shader_stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? &ps_compile_args : &compile_args,
@@ -3896,10 +3894,6 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     struct d3d12_pipeline_state *object;
     HRESULT hr;
 
-    if (desc->cached_pso.blob.CachedBlobSizeInBytes)
-        if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, &desc->cached_pso)))
-            return hr;
-
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
@@ -3921,6 +3915,18 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
     if (root_signature)
         object->root_signature_compat_hash = root_signature->compatibility_hash;
+
+    if (desc->cached_pso.blob.CachedBlobSizeInBytes)
+    {
+        if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, &desc->cached_pso,
+                object->root_signature_compat_hash)))
+        {
+            if (object->private_root_signature)
+                ID3D12RootSignature_Release(object->private_root_signature);
+            vkd3d_free(object);
+            return hr;
+        }
+    }
 
     switch (bind_point)
     {

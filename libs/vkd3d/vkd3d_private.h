@@ -1645,7 +1645,9 @@ struct d3d12_pipeline_library
     struct d3d12_device *device;
 
     rwlock_t mutex;
-    struct hash_map map;
+    struct hash_map pso_map;
+    struct hash_map driver_cache_map;
+    struct hash_map spirv_cache_map;
 
     size_t total_name_table_size;
     size_t total_blob_size;
@@ -1663,11 +1665,12 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
         VkShaderStageFlagBits stage,
-        vkd3d_shader_hash_t root_signature_compat_hash,
         struct vkd3d_shader_code *spirv_code);
-VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state, size_t *size, void *data);
+VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_library,
+        const struct d3d12_pipeline_state *state, size_t *size, void *data);
 HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
-        const struct d3d12_cached_pipeline_state *state);
+        const struct d3d12_cached_pipeline_state *state,
+        vkd3d_shader_hash_t root_signature_compat_hash);
 
 struct vkd3d_buffer
 {

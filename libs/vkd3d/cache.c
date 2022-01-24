@@ -125,40 +125,60 @@ VkResult vkd3d_create_pipeline_cache(struct d3d12_device *device,
     return VK_CALL(vkCreatePipelineCache(device->vk_device, &info, NULL, cache));
 }
 
-#define VKD3D_CACHE_BLOB_VERSION MAKE_MAGIC('V','K','B',2)
+#define VKD3D_CACHE_BLOB_VERSION MAKE_MAGIC('V','K','B',3)
 
 enum vkd3d_pipeline_blob_chunk_type
 {
     /* VkPipelineCache blob data. */
     VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE = 0,
     /* VkShaderStage is stored in upper 16 bits. */
-    /* TODO: We might want to deduplicate the SPIR-V through some extra indirection. */
     VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV = 1,
-    /* TODO: We can expand this as needed if we get a way to not have to store raw SPIR-V. */
+    /* For when a blob is stored inside a pipeline library, we can reference blobs by hash instead
+     * to achieve de-dupe. We'll need to maintain the older path as well however since we need to support GetCachedBlob()
+     * as a standalone thing as well. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE_LINK = 2,
+    /* VkShaderStage is stored in upper 16 bits. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV_LINK = 3,
+    /* VkShaderStage is stored in upper 16 bits. */
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_SHADER_META = 4,
+    VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT = 5,
     VKD3D_PIPELINE_BLOB_CHUNK_TYPE_MASK = 0xffff,
     VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT = 16,
 };
 
-#define VKD3D_PIPELINE_BLOB_CHUNK_ALIGN 4
+#define VKD3D_PIPELINE_BLOB_CHUNK_ALIGN 8
 struct vkd3d_pipeline_blob_chunk
 {
     uint32_t type; /* vkd3d_pipeline_blob_chunk_type with extra data in upper bits. */
     uint32_t size; /* size of data. Does not include size of header. */
-    uint8_t data[];
+    uint8_t data[]; /* struct vkd3d_pipeline_blob_chunk_*. */
 };
 
 struct vkd3d_pipeline_blob_chunk_spirv
 {
-    uint64_t root_signature_compat_hash;
-    struct vkd3d_shader_meta meta;
     uint32_t decompressed_spirv_size;
     uint32_t compressed_spirv_size;
     uint8_t data[];
 };
 
+struct vkd3d_pipeline_blob_chunk_link
+{
+    uint64_t hash;
+};
+
+struct vkd3d_pipeline_blob_chunk_shader_meta
+{
+    struct vkd3d_shader_meta meta;
+};
+
+struct vkd3d_pipeline_blob_chunk_pso_compat
+{
+    uint64_t root_signature_compat_hash;
+};
+
 STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk) == 8);
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob_chunk, data) == 8);
-STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk_spirv) == 16 + sizeof(struct vkd3d_shader_meta));
+STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk_spirv) == 8);
 STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk_spirv) == offsetof(struct vkd3d_pipeline_blob_chunk_spirv, data));
 
 #define VKD3D_PIPELINE_BLOB_ALIGN 8
@@ -174,6 +194,13 @@ struct vkd3d_pipeline_blob
     uint8_t data[]; /* vkd3d_pipeline_blob_chunks laid out one after the other with u32 alignment. */
 };
 
+/* Used for de-duplicated pipeline cache and SPIR-V hashmaps. */
+struct vkd3d_pipeline_blob_internal
+{
+    uint32_t checksum; /* Simple checksum for data[] as a sanity check. */
+    uint8_t data[]; /* Either raw uint8_t for pipeline cache, or vkd3d_pipeline_blob_chunk_spirv. */
+};
+
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == (32 + VK_UUID_SIZE));
 STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == sizeof(struct vkd3d_pipeline_blob));
 
@@ -187,11 +214,34 @@ static uint32_t vkd3d_pipeline_blob_compute_data_checksum(const uint8_t *data, s
     return hash_uint64(h);
 }
 
+static const struct vkd3d_pipeline_blob_chunk *find_blob_chunk(const struct vkd3d_pipeline_blob_chunk *chunk,
+        size_t size, uint32_t type)
+{
+    uint32_t aligned_chunk_size;
+
+    while (size >= sizeof(struct vkd3d_pipeline_blob_chunk))
+    {
+        aligned_chunk_size = align(chunk->size + sizeof(struct vkd3d_pipeline_blob_chunk),
+                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        if (aligned_chunk_size > size)
+            return NULL;
+        if (chunk->type == type)
+            return chunk;
+
+        chunk = (const struct vkd3d_pipeline_blob_chunk *)&chunk->data[align(chunk->size, VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)];
+        size -= aligned_chunk_size;
+    }
+
+    return NULL;
+}
+
 HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
-        const struct d3d12_cached_pipeline_state *state)
+        const struct d3d12_cached_pipeline_state *state,
+        vkd3d_shader_hash_t root_signature_compat_hash)
 {
     const VkPhysicalDeviceProperties *device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    const struct vkd3d_pipeline_blob_chunk *chunk;
     uint32_t checksum;
 
     /* Avoid E_INVALIDARG with an invalid header size, since that may confuse some games */
@@ -221,6 +271,20 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     }
 
+    /* Fetch compat info. */
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
+            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT);
+    if (!chunk || chunk->size != sizeof(root_signature_compat_hash))
+        return E_FAIL;
+
+    /* Verify the expected root signature that was used to generate the SPIR-V. */
+    if (memcmp(&root_signature_compat_hash, chunk->data, chunk->size) != 0)
+    {
+        WARN("Root signature compatibility hash mismatch.\n");
+        return E_INVALIDARG;
+    }
+
     return S_OK;
 }
 
@@ -230,27 +294,6 @@ static struct vkd3d_pipeline_blob_chunk *finish_and_iterate_blob_chunk(struct vk
     /* Ensure we get stable hashes if we need to pad. */
     memset(&chunk->data[chunk->size], 0, aligned_size - chunk->size);
     return (struct vkd3d_pipeline_blob_chunk *)&chunk->data[aligned_size];
-}
-
-static const struct vkd3d_pipeline_blob_chunk *find_blob_chunk(const struct vkd3d_pipeline_blob_chunk *chunk,
-        size_t size, uint32_t type)
-{
-    uint32_t aligned_chunk_size;
-
-    while (size >= sizeof(struct vkd3d_pipeline_blob_chunk))
-    {
-        aligned_chunk_size = align(chunk->size + sizeof(struct vkd3d_pipeline_blob_chunk),
-                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-        if (aligned_chunk_size > size)
-            return NULL;
-        if (chunk->type == type)
-            return chunk;
-
-        chunk = (const struct vkd3d_pipeline_blob_chunk *)&chunk->data[align(chunk->size, VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)];
-        size -= aligned_chunk_size;
-    }
-
-    return NULL;
 }
 
 HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
@@ -283,11 +326,11 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
         VkShaderStageFlagBits stage,
-        vkd3d_shader_hash_t root_signature_compat_hash,
         struct vkd3d_shader_code *spirv_code)
 {
     const struct vkd3d_shader_code dxbc = { code->pShaderBytecode, code->BytecodeLength };
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    const struct vkd3d_pipeline_blob_chunk_shader_meta *meta;
     const struct vkd3d_pipeline_blob_chunk_spirv *spirv;
     const struct vkd3d_pipeline_blob_chunk *chunk;
     vkd3d_shader_hash_t dxbc_hash;
@@ -296,23 +339,14 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     if (!state->blob.CachedBlobSizeInBytes)
         return E_FAIL;
 
+    /* Fetch shader meta. */
     chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
             state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
-            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
-
-    if (!chunk)
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_SHADER_META | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
+    if (!chunk || chunk->size != sizeof(*meta))
         return E_FAIL;
-
-    spirv = (const struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
-
-    spirv_code->meta = spirv->meta;
-
-    /* Verify the expected root signature that was used to generate the SPIR-V. */
-    if (root_signature_compat_hash != spirv->root_signature_compat_hash)
-    {
-        WARN("Root signature compatibility hash mismatch.\n");
-        return E_INVALIDARG;
-    }
+    meta = (const struct vkd3d_pipeline_blob_chunk_shader_meta*)chunk->data;
+    memcpy(&spirv_code->meta, &meta->meta, sizeof(meta->meta));
 
     /* Verify that DXBC blob hash matches with what we expect. */
     dxbc_hash = vkd3d_shader_hash(&dxbc);
@@ -322,6 +356,16 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
                 dxbc_hash, spirv_code->meta.hash);
         return E_INVALIDARG;
     }
+
+    /* Aim to pull SPIR-V either from inlined chunk, or a link. */
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
+            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
+
+    if (!chunk)
+        return E_FAIL;
+
+    spirv = (const struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
 
     duped_code = vkd3d_malloc(spirv->decompressed_spirv_size);
     if (!duped_code)
@@ -342,10 +386,13 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     return S_OK;
 }
 
-VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state, size_t *size, void *data)
+VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_library,
+        const struct d3d12_pipeline_state *state, size_t *size, void *data)
 {
     const VkPhysicalDeviceProperties *device_properties = &state->device->device_info.properties2.properties;
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
+    struct vkd3d_pipeline_blob_chunk_pso_compat *pso_compat;
+    struct vkd3d_pipeline_blob_chunk_shader_meta *meta;
     struct vkd3d_pipeline_blob_chunk_spirv *spirv;
     size_t varint_size[VKD3D_MAX_SHADER_STAGES];
     struct vkd3d_pipeline_blob *blob = data;
@@ -353,32 +400,70 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
     size_t vk_blob_size_pipeline_cache = 0;
     size_t total_size = sizeof(*blob);
     size_t vk_blob_size = 0;
+    bool need_blob_sizes;
     unsigned int i;
     VkResult vr;
 
+    need_blob_sizes = !pipeline_library || data;
+
+    /* PSO compatibility information is global to a PSO. */
+    vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+            sizeof(struct vkd3d_pipeline_blob_chunk_pso_compat),
+            VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+
     if (state->vk_pso_cache)
     {
-        if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size_pipeline_cache, NULL))))
+        if (need_blob_sizes)
         {
-            ERR("Failed to retrieve pipeline cache size, vr %d.\n", vr);
-            return vr;
+            if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size_pipeline_cache, NULL))))
+            {
+                ERR("Failed to retrieve pipeline cache size, vr %d.\n", vr);
+                return vr;
+            }
         }
 
-        vk_blob_size += align(vk_blob_size_pipeline_cache + sizeof(struct vkd3d_pipeline_blob_chunk),
-                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        if (pipeline_library)
+        {
+            vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                    sizeof(struct vkd3d_pipeline_blob_chunk_link),
+                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        }
+        else
+        {
+            vk_blob_size += align(vk_blob_size_pipeline_cache +
+                    sizeof(struct vkd3d_pipeline_blob_chunk),
+                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        }
     }
 
-    /* TODO: We might want to only store references to a de-duped SPIR-V pool here. */
     if (d3d12_pipeline_state_is_graphics(state))
     {
         for (i = 0; i < state->graphics.stage_count; i++)
         {
             if (state->graphics.code[i].size)
             {
-                varint_size[i] = vkd3d_compute_size_varint(state->graphics.code[i].code,
-                        state->graphics.code[i].size / sizeof(uint32_t));
+                if (need_blob_sizes)
+                {
+                    varint_size[i] = vkd3d_compute_size_varint(state->graphics.code[i].code,
+                            state->graphics.code[i].size / sizeof(uint32_t));
+                }
+
+                /* If we have a pipeline library, we will store a reference to the SPIR-V instead. */
+                if (pipeline_library)
+                {
+                    vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                            sizeof(struct vkd3d_pipeline_blob_chunk_link),
+                            VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+                }
+                else
+                {
+                    vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                            sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[i],
+                            VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+                }
+
                 vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                                sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[i],
+                        sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta),
                         VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
             }
         }
@@ -387,10 +472,27 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
     {
         if (state->compute.code.size)
         {
-            varint_size[0] = vkd3d_compute_size_varint(state->compute.code.code,
-                    state->compute.code.size / sizeof(uint32_t));
+            if (need_blob_sizes)
+            {
+                varint_size[0] = vkd3d_compute_size_varint(state->compute.code.code,
+                        state->compute.code.size / sizeof(uint32_t));
+            }
+
+            if (pipeline_library)
+            {
+                vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                        sizeof(struct vkd3d_pipeline_blob_chunk_link),
+                        VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+            }
+            else
+            {
+                vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                        sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[0],
+                        VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+            }
+
             vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                            sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[0],
+                    sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta),
                     VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
         }
     }
@@ -410,8 +512,15 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
         memcpy(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE);
         chunk = (struct vkd3d_pipeline_blob_chunk *)blob->data;
 
+        chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT;
+        chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_pso_compat);
+        pso_compat = (struct vkd3d_pipeline_blob_chunk_pso_compat*)chunk->data;
+        pso_compat->root_signature_compat_hash = state->root_signature_compat_hash;
+        chunk = finish_and_iterate_blob_chunk(chunk);
+
         if (state->vk_pso_cache)
         {
+            /* Store PSO cache, or link to it if using pipeline cache. */
             chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE;
             chunk->size = vk_blob_size_pipeline_cache;
             if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache, &vk_blob_size_pipeline_cache, chunk->data))))
@@ -425,19 +534,25 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
             {
                 if (state->graphics.code[i].size)
                 {
+                    /* Store inline SPIR-V, or (TODO) a link to SPIR-V in pipeline library. */
                     chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
                             (state->graphics.stages[i].stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
                     chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[i];
 
                     spirv = (struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
-                    spirv->meta = state->graphics.code[i].meta;
                     spirv->compressed_spirv_size = varint_size[i];
                     spirv->decompressed_spirv_size = state->graphics.code[i].size;
-                    spirv->root_signature_compat_hash = state->root_signature_compat_hash;
 
                     vkd3d_encode_varint(spirv->data, state->graphics.code[i].code,
                             state->graphics.code[i].size / sizeof(uint32_t));
+                    chunk = finish_and_iterate_blob_chunk(chunk);
 
+                    /* Store meta information for SPIR-V. */
+                    chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_SHADER_META |
+                            (state->graphics.stages[i].stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
+                    chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta);
+                    meta = (struct vkd3d_pipeline_blob_chunk_shader_meta*)chunk->data;
+                    meta->meta = state->graphics.code[i].meta;
                     chunk = finish_and_iterate_blob_chunk(chunk);
                 }
             }
@@ -446,19 +561,25 @@ VkResult vkd3d_serialize_pipeline_state(const struct d3d12_pipeline_state *state
         {
             if (state->compute.code.size)
             {
+                /* Store inline SPIR-V, or (TODO) a link to SPIR-V in pipeline library. */
                 chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
                         (VK_SHADER_STAGE_COMPUTE_BIT << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
                 chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[0];
 
                 spirv = (struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
-                spirv->meta = state->compute.code.meta;
                 spirv->compressed_spirv_size = varint_size[0];
                 spirv->decompressed_spirv_size = state->compute.code.size;
-                spirv->root_signature_compat_hash = state->root_signature_compat_hash;
 
                 vkd3d_encode_varint(spirv->data, state->compute.code.code,
                         state->compute.code.size / sizeof(uint32_t));
+                chunk = finish_and_iterate_blob_chunk(chunk);
 
+                /* Store meta information for SPIR-V. */
+                chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_SHADER_META |
+                        (VK_SHADER_STAGE_COMPUTE_BIT << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT);
+                chunk->size = sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta);
+                meta = (struct vkd3d_pipeline_blob_chunk_shader_meta*)chunk->data;
+                meta->meta = state->compute.code.meta;
                 chunk = finish_and_iterate_blob_chunk(chunk);
             }
         }
@@ -474,6 +595,7 @@ struct vkd3d_cached_pipeline_key
 {
     size_t name_length;
     const void *name;
+    uint64_t internal_key_hash; /* Used for internal keys which are just hashes. Used if name_length is 0. */
 };
 
 struct vkd3d_cached_pipeline_data
@@ -490,7 +612,7 @@ struct vkd3d_cached_pipeline_entry
     struct vkd3d_cached_pipeline_data data;
 };
 
-static uint32_t vkd3d_cached_pipeline_hash(const void *key)
+static uint32_t vkd3d_cached_pipeline_hash_name(const void *key)
 {
     const struct vkd3d_cached_pipeline_key *k = key;
     uint32_t hash = 0;
@@ -507,13 +629,26 @@ static uint32_t vkd3d_cached_pipeline_hash(const void *key)
     return hash;
 }
 
-static bool vkd3d_cached_pipeline_compare(const void *key, const struct hash_map_entry *entry)
+static uint32_t vkd3d_cached_pipeline_hash_internal(const void *key)
+{
+    const struct vkd3d_cached_pipeline_key *k = key;
+    return hash_uint64(k->internal_key_hash);
+}
+
+static bool vkd3d_cached_pipeline_compare_name(const void *key, const struct hash_map_entry *entry)
 {
     const struct vkd3d_cached_pipeline_entry *e = (const struct vkd3d_cached_pipeline_entry*)entry;
     const struct vkd3d_cached_pipeline_key *k = key;
 
     return k->name_length == e->key.name_length &&
             !memcmp(k->name, e->key.name, k->name_length);
+}
+
+static bool vkd3d_cached_pipeline_compare_internal(const void *key, const struct hash_map_entry *entry)
+{
+    const struct vkd3d_cached_pipeline_entry *e = (const struct vkd3d_cached_pipeline_entry*)entry;
+    const struct vkd3d_cached_pipeline_key *k = key;
+    return k->internal_key_hash == e->key.internal_key_hash;
 }
 
 struct vkd3d_serialized_pipeline_toc_entry
@@ -524,13 +659,15 @@ struct vkd3d_serialized_pipeline_toc_entry
 };
 STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_toc_entry) == 16);
 
-#define VKD3D_PIPELINE_LIBRARY_VERSION MAKE_MAGIC('V','K','L',2)
+#define VKD3D_PIPELINE_LIBRARY_VERSION MAKE_MAGIC('V','K','L',3)
 
 struct vkd3d_serialized_pipeline_library
 {
     uint32_t version;
     uint32_t vendor_id;
     uint32_t device_id;
+    uint32_t spirv_count;
+    uint32_t driver_cache_count;
     uint32_t pipeline_count;
     uint64_t vkd3d_build;
     uint64_t vkd3d_shader_interface_key;
@@ -550,7 +687,7 @@ struct vkd3d_serialized_pipeline_library
  */
 
 STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == offsetof(struct vkd3d_serialized_pipeline_library, entries));
-STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == 32 + VK_UUID_SIZE);
+STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == 40 + VK_UUID_SIZE);
 
 /* ID3D12PipelineLibrary */
 static inline struct d3d12_pipeline_library *impl_from_ID3D12PipelineLibrary(d3d12_pipeline_library_iface *iface)
@@ -567,17 +704,21 @@ static void d3d12_pipeline_library_serialize_entry(
     header->name_length = entry->key.name_length;
     header->blob_length = entry->data.blob_length;
 
-    memcpy(data + name_offset, entry->key.name, entry->key.name_length);
+    if (entry->key.name_length)
+        memcpy(data + name_offset, entry->key.name, entry->key.name_length);
+    else
+        memcpy(data + name_offset, &entry->key.internal_key_hash, sizeof(entry->key.internal_key_hash));
+
     memcpy(data + blob_offset, entry->data.blob, entry->data.blob_length);
 }
 
-static void d3d12_pipeline_library_cleanup(struct d3d12_pipeline_library *pipeline_library, struct d3d12_device *device)
+static void d3d12_pipeline_library_cleanup_map(struct hash_map *map)
 {
     size_t i;
 
-    for (i = 0; i < pipeline_library->map.entry_count; i++)
+    for (i = 0; i < map->entry_count; i++)
     {
-        struct vkd3d_cached_pipeline_entry *e = (struct vkd3d_cached_pipeline_entry*)hash_map_get_entry(&pipeline_library->map, i);
+        struct vkd3d_cached_pipeline_entry *e = (struct vkd3d_cached_pipeline_entry*)hash_map_get_entry(map, i);
 
         if ((e->entry.flags & HASH_MAP_ENTRY_OCCUPIED) && e->data.is_new)
         {
@@ -586,7 +727,14 @@ static void d3d12_pipeline_library_cleanup(struct d3d12_pipeline_library *pipeli
         }
     }
 
-    hash_map_clear(&pipeline_library->map);
+    hash_map_clear(map);
+}
+
+static void d3d12_pipeline_library_cleanup(struct d3d12_pipeline_library *pipeline_library, struct d3d12_device *device)
+{
+    d3d12_pipeline_library_cleanup_map(&pipeline_library->pso_map);
+    d3d12_pipeline_library_cleanup_map(&pipeline_library->driver_cache_map);
+    d3d12_pipeline_library_cleanup_map(&pipeline_library->spirv_cache_map);
 
     vkd3d_private_store_destroy(&pipeline_library->private_store);
     rwlock_destroy(&pipeline_library->mutex);
@@ -683,6 +831,29 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_GetDevice(d3d12_pipeline
     return d3d12_device_query_interface(pipeline_library->device, iid, device);
 }
 
+static uint32_t d3d12_cached_pipeline_entry_name_table_size(const struct vkd3d_cached_pipeline_entry *entry)
+{
+    if (entry->key.name_length)
+        return entry->key.name_length;
+    else
+        return sizeof(entry->key.internal_key_hash);
+}
+
+static bool d3d12_pipeline_library_insert_hash_map_blob(struct d3d12_pipeline_library *pipeline_library,
+        struct hash_map *map, const struct vkd3d_cached_pipeline_entry *entry)
+{
+    const struct vkd3d_cached_pipeline_entry *new_entry;
+    if ((new_entry = (const struct vkd3d_cached_pipeline_entry*)hash_map_insert(map, &entry->key, &entry->entry)) &&
+            memcmp(&new_entry->data, &entry->data, sizeof(entry->data)) == 0)
+    {
+        pipeline_library->total_name_table_size += d3d12_cached_pipeline_entry_name_table_size(entry);
+        pipeline_library->total_blob_size += align(entry->data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
+        return true;
+    }
+    else
+        return false;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipeline_library_iface *iface,
         LPCWSTR name, ID3D12PipelineState *pipeline)
 {
@@ -703,8 +874,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
 
     entry.key.name_length = vkd3d_wcslen(name) * sizeof(WCHAR);
     entry.key.name = name;
+    entry.key.internal_key_hash = 0;
 
-    if (hash_map_find(&pipeline_library->map, &entry.key))
+    if (hash_map_find(&pipeline_library->pso_map, &entry.key))
     {
         WARN("Pipeline %s already exists.\n", debugstr_w(name));
         rwlock_unlock_write(&pipeline_library->mutex);
@@ -721,7 +893,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     memcpy(new_name, name, entry.key.name_length);
     entry.key.name = new_name;
 
-    if (FAILED(vr = vkd3d_serialize_pipeline_state(pipeline_state, &entry.data.blob_length, NULL)))
+    if (FAILED(vr = vkd3d_serialize_pipeline_state(NULL /* TODO */, pipeline_state, &entry.data.blob_length, NULL)))
     {
         vkd3d_free(new_name);
         rwlock_unlock_write(&pipeline_library->mutex);
@@ -735,7 +907,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
         return E_OUTOFMEMORY;
     }
 
-    if (FAILED(vr = vkd3d_serialize_pipeline_state(pipeline_state, &entry.data.blob_length, new_blob)))
+    if (FAILED(vr = vkd3d_serialize_pipeline_state(NULL /* TODO */, pipeline_state, &entry.data.blob_length, new_blob)))
     {
         vkd3d_free(new_name);
         vkd3d_free(new_blob);
@@ -746,9 +918,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     entry.data.blob = new_blob;
     entry.data.is_new = true;
 
-    pipeline_library->total_name_table_size += entry.key.name_length;
-    pipeline_library->total_blob_size += align(entry.data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
-    if (!hash_map_insert(&pipeline_library->map, &entry.key, &entry.entry))
+    if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library, &pipeline_library->pso_map, &entry))
     {
         vkd3d_free(new_name);
         vkd3d_free(new_blob);
@@ -776,7 +946,7 @@ static HRESULT d3d12_pipeline_library_load_pipeline(struct d3d12_pipeline_librar
     key.name_length = vkd3d_wcslen(name) * sizeof(WCHAR);
     key.name = name;
 
-    if (!(e = (const struct vkd3d_cached_pipeline_entry*)hash_map_find(&pipeline_library->map, &key)))
+    if (!(e = (const struct vkd3d_cached_pipeline_entry*)hash_map_find(&pipeline_library->pso_map, &key)))
     {
         WARN("Pipeline %s does not exist.\n", debugstr_w(name));
         rwlock_unlock_read(&pipeline_library->mutex);
@@ -835,13 +1005,20 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_LoadComputePipeline(d3d1
             &IID_ID3D12PipelineState, iid, pipeline_state);
 }
 
+static size_t d3d12_pipeline_library_get_aligned_name_table_size(struct d3d12_pipeline_library *pipeline_library)
+{
+    return align(pipeline_library->total_name_table_size, VKD3D_PIPELINE_BLOB_ALIGN);
+}
+
 static size_t d3d12_pipeline_library_get_serialized_size(struct d3d12_pipeline_library *pipeline_library)
 {
     size_t total_size = 0;
 
     total_size += sizeof(struct vkd3d_serialized_pipeline_library);
-    total_size += sizeof(struct vkd3d_serialized_pipeline_toc_entry) * pipeline_library->map.used_count;
-    total_size += align(pipeline_library->total_name_table_size, VKD3D_PIPELINE_BLOB_ALIGN);
+    total_size += sizeof(struct vkd3d_serialized_pipeline_toc_entry) * pipeline_library->pso_map.used_count;
+    total_size += sizeof(struct vkd3d_serialized_pipeline_toc_entry) * pipeline_library->spirv_cache_map.used_count;
+    total_size += sizeof(struct vkd3d_serialized_pipeline_toc_entry) * pipeline_library->driver_cache_map.used_count;
+    total_size += d3d12_pipeline_library_get_aligned_name_table_size(pipeline_library);
     total_size += pipeline_library->total_blob_size;
 
     return total_size;
@@ -867,6 +1044,33 @@ static SIZE_T STDMETHODCALLTYPE d3d12_pipeline_library_GetSerializedSize(d3d12_p
     return total_size;
 }
 
+static void d3d12_pipeline_library_serialize_hash_map(const struct hash_map *map,
+        struct vkd3d_serialized_pipeline_toc_entry **inout_toc_entries, uint8_t *serialized_data,
+        size_t *inout_name_offset, size_t *inout_blob_offset)
+{
+    struct vkd3d_serialized_pipeline_toc_entry *toc_entries = *inout_toc_entries;
+    size_t name_offset = *inout_name_offset;
+    size_t blob_offset = *inout_blob_offset;
+    uint32_t i;
+
+    for (i = 0; i < map->entry_count; i++)
+    {
+        struct vkd3d_cached_pipeline_entry *e = (struct vkd3d_cached_pipeline_entry*)hash_map_get_entry(map, i);
+
+        if (e->entry.flags & HASH_MAP_ENTRY_OCCUPIED)
+        {
+            d3d12_pipeline_library_serialize_entry(e, toc_entries, serialized_data, name_offset, blob_offset);
+            toc_entries++;
+            name_offset += e->key.name_length ? e->key.name_length : sizeof(e->key.internal_key_hash);
+            blob_offset += align(e->data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
+        }
+    }
+
+    *inout_toc_entries = toc_entries;
+    *inout_name_offset = name_offset;
+    *inout_blob_offset = blob_offset;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline_library_iface *iface,
         void *data, SIZE_T data_size)
 {
@@ -875,10 +1079,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     struct vkd3d_serialized_pipeline_library *header = data;
     struct vkd3d_serialized_pipeline_toc_entry *toc_entries;
     uint8_t *serialized_data;
+    size_t total_toc_entries;
     size_t required_size;
     size_t name_offset;
     size_t blob_offset;
-    uint32_t i;
     int rc;
 
     TRACE("iface %p.\n", iface);
@@ -899,28 +1103,26 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     header->version = VKD3D_PIPELINE_LIBRARY_VERSION;
     header->vendor_id = device_properties->vendorID;
     header->device_id = device_properties->deviceID;
-    header->pipeline_count = pipeline_library->map.used_count;
+    header->pipeline_count = pipeline_library->pso_map.used_count;
+    header->spirv_count = pipeline_library->spirv_cache_map.used_count;
+    header->driver_cache_count = pipeline_library->driver_cache_map.used_count;
     header->vkd3d_build = vkd3d_build;
     header->vkd3d_shader_interface_key = pipeline_library->device->shader_interface_key;
     memcpy(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE);
 
+    total_toc_entries = header->pipeline_count + header->spirv_count + header->driver_cache_count;
+
     toc_entries = header->entries;
-    serialized_data = (uint8_t *)&toc_entries[pipeline_library->map.used_count];
+    serialized_data = (uint8_t *)&toc_entries[total_toc_entries];
     name_offset = 0;
-    blob_offset = align(pipeline_library->total_name_table_size, VKD3D_PIPELINE_BLOB_ALIGN);
+    blob_offset = d3d12_pipeline_library_get_aligned_name_table_size(pipeline_library);
 
-    for (i = 0; i < pipeline_library->map.entry_count; i++)
-    {
-        struct vkd3d_cached_pipeline_entry *e = (struct vkd3d_cached_pipeline_entry*)hash_map_get_entry(&pipeline_library->map, i);
-
-        if (e->entry.flags & HASH_MAP_ENTRY_OCCUPIED)
-        {
-            d3d12_pipeline_library_serialize_entry(e, toc_entries, serialized_data, name_offset, blob_offset);
-            toc_entries++;
-            name_offset += e->key.name_length;
-            blob_offset += align(e->data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
-        }
-    }
+    d3d12_pipeline_library_serialize_hash_map(&pipeline_library->spirv_cache_map, &toc_entries,
+            serialized_data, &name_offset, &blob_offset);
+    d3d12_pipeline_library_serialize_hash_map(&pipeline_library->driver_cache_map, &toc_entries,
+            serialized_data, &name_offset, &blob_offset);
+    d3d12_pipeline_library_serialize_hash_map(&pipeline_library->pso_map, &toc_entries,
+            serialized_data, &name_offset, &blob_offset);
 
     rwlock_unlock_read(&pipeline_library->mutex);
     return S_OK;
@@ -972,6 +1174,61 @@ static CONST_VTBL struct ID3D12PipelineLibrary1Vtbl d3d12_pipeline_library_vtbl 
     d3d12_pipeline_library_LoadPipeline,
 };
 
+static HRESULT d3d12_pipeline_library_unserialize_hash_map(
+        struct d3d12_pipeline_library *pipeline_library,
+        const struct vkd3d_serialized_pipeline_toc_entry *entries,
+        size_t entries_count, struct hash_map *map,
+        const uint8_t *serialized_data_base, size_t serialized_data_size,
+        const uint8_t **inout_name_table)
+{
+    const uint8_t *name_table = *inout_name_table;
+    uint32_t i;
+
+    /* The application is not allowed to free the blob, so we
+     * can safely use pointers without copying the data first. */
+    for (i = 0; i < entries_count; i++)
+    {
+        const struct vkd3d_serialized_pipeline_toc_entry *toc_entry = &entries[i];
+        struct vkd3d_cached_pipeline_entry entry;
+
+        entry.key.name_length = toc_entry->name_length;
+
+        if (entry.key.name_length)
+        {
+            entry.key.name = name_table;
+            entry.key.internal_key_hash = 0;
+            /* Verify that name table entry does not overflow. */
+            if (name_table + entry.key.name_length > serialized_data_base + serialized_data_size)
+                return E_INVALIDARG;
+            name_table += entry.key.name_length;
+        }
+        else
+        {
+            entry.key.name = NULL;
+            entry.key.internal_key_hash = 0;
+            /* Verify that name table entry does not overflow. */
+            if (name_table + sizeof(entry.key.internal_key_hash) > serialized_data_base + serialized_data_size)
+                return E_INVALIDARG;
+            memcpy(&entry.key.internal_key_hash, name_table, sizeof(entry.key.internal_key_hash));
+            name_table += sizeof(entry.key.internal_key_hash);
+        }
+
+        /* Verify that blob entry does not overflow. */
+        if (toc_entry->blob_offset + toc_entry->blob_length > serialized_data_size)
+            return E_INVALIDARG;
+
+        entry.data.blob_length = toc_entry->blob_length;
+        entry.data.blob = serialized_data_base + toc_entry->blob_offset;
+        entry.data.is_new = false;
+
+        if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library, map, &entry))
+            return E_OUTOFMEMORY;
+    }
+
+    *inout_name_table = name_table;
+    return S_OK;
+}
+
 static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *pipeline_library,
         struct d3d12_device *device, const void *blob, size_t blob_length)
 {
@@ -981,7 +1238,9 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
     size_t serialized_data_size;
     const uint8_t *name_table;
     size_t header_entry_size;
+    size_t total_toc_entries;
     uint32_t i;
+    HRESULT hr;
 
     /* Same logic as for pipeline blobs, indicate that the app needs
      * to rebuild the pipeline library in case vkd3d itself or the
@@ -997,44 +1256,40 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
             memcmp(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
+    total_toc_entries = header->pipeline_count + header->spirv_count + header->driver_cache_count;
+
     header_entry_size = offsetof(struct vkd3d_serialized_pipeline_library, entries) +
-            header->pipeline_count * sizeof(struct vkd3d_serialized_pipeline_toc_entry);
+            total_toc_entries * sizeof(struct vkd3d_serialized_pipeline_toc_entry);
+
     if (blob_length < header_entry_size)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
     serialized_data_size = blob_length - header_entry_size;
-    serialized_data_base = (const uint8_t *)&header->entries[header->pipeline_count];
+    serialized_data_base = (const uint8_t *)&header->entries[total_toc_entries];
     name_table = serialized_data_base;
 
-    /* The application is not allowed to free the blob, so we
-     * can safely use pointers without copying the data first. */
-    for (i = 0; i < header->pipeline_count; i++)
-    {
-        const struct vkd3d_serialized_pipeline_toc_entry *toc_entry = &header->entries[i];
-        struct vkd3d_cached_pipeline_entry entry;
+    i = 0;
 
-        entry.key.name_length = toc_entry->name_length;
-        entry.key.name = name_table;
+    if (FAILED(hr = d3d12_pipeline_library_unserialize_hash_map(pipeline_library,
+            &header->entries[i], header->spirv_count,
+            &pipeline_library->spirv_cache_map, serialized_data_base, serialized_data_size,
+            &name_table)))
+        return hr;
+    i += header->spirv_count;
 
-        /* Verify that name table entry does not overflow. */
-        if (name_table + toc_entry->name_length > serialized_data_base + serialized_data_size)
-            return E_INVALIDARG;
+    if (FAILED(hr = d3d12_pipeline_library_unserialize_hash_map(pipeline_library,
+            &header->entries[i], header->driver_cache_count,
+            &pipeline_library->driver_cache_map, serialized_data_base, serialized_data_size,
+            &name_table)))
+        return hr;
+    i += header->driver_cache_count;
 
-        name_table += toc_entry->name_length;
-
-        /* Verify that blob entry does not overflow. */
-        if (toc_entry->blob_offset + toc_entry->blob_length > serialized_data_size)
-            return E_INVALIDARG;
-
-        entry.data.blob_length = toc_entry->blob_length;
-        entry.data.blob = serialized_data_base + toc_entry->blob_offset;
-        entry.data.is_new = false;
-
-        pipeline_library->total_name_table_size += entry.key.name_length;
-        pipeline_library->total_blob_size += align(entry.data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
-        if (!hash_map_insert(&pipeline_library->map, &entry.key, &entry.entry))
-            return E_OUTOFMEMORY;
-    }
+    if (FAILED(hr = d3d12_pipeline_library_unserialize_hash_map(pipeline_library,
+            &header->entries[i], header->pipeline_count,
+            &pipeline_library->pso_map, serialized_data_base, serialized_data_size,
+            &name_table)))
+        return hr;
+    i += header->pipeline_count;
 
     return S_OK;
 }
@@ -1055,8 +1310,12 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
     if ((rc = rwlock_init(&pipeline_library->mutex)))
         return hresult_from_errno(rc);
 
-    hash_map_init(&pipeline_library->map, &vkd3d_cached_pipeline_hash,
-            &vkd3d_cached_pipeline_compare, sizeof(struct vkd3d_cached_pipeline_entry));
+    hash_map_init(&pipeline_library->spirv_cache_map, vkd3d_cached_pipeline_hash_internal,
+            vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
+    hash_map_init(&pipeline_library->driver_cache_map, vkd3d_cached_pipeline_hash_internal,
+            vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
+    hash_map_init(&pipeline_library->pso_map, vkd3d_cached_pipeline_hash_name,
+            vkd3d_cached_pipeline_compare_name, sizeof(struct vkd3d_cached_pipeline_entry));
 
     if (blob_length)
     {
@@ -1071,7 +1330,9 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
     return hr;
 
 cleanup_hash_map:
-    hash_map_clear(&pipeline_library->map);
+    hash_map_clear(&pipeline_library->pso_map);
+    hash_map_clear(&pipeline_library->spirv_cache_map);
+    hash_map_clear(&pipeline_library->driver_cache_map);
 cleanup_mutex:
     rwlock_destroy(&pipeline_library->mutex);
     return hr;
