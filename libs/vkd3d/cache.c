@@ -1,5 +1,6 @@
 /*
  * Copyright 2020 Philip Rebohle for Valve Corporation
+ * Copyright 2022 Hans-Kristian Arntzen for Valve Corporation
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -243,11 +244,10 @@ STATIC_ASSERT(offsetof(struct vkd3d_pipeline_blob, data) == sizeof(struct vkd3d_
 
 static uint32_t vkd3d_pipeline_blob_compute_data_checksum(const uint8_t *data, size_t size)
 {
-    uint64_t h = hash_fnv1_init();
-    size_t i;
+    const struct vkd3d_shader_code code = { data, size };
+    vkd3d_shader_hash_t h;
 
-    for (i = 0; i < size; i++)
-        h = hash_fnv1_iterate_u8(h, data[i]);
+    h = vkd3d_shader_hash(&code);
     return hash_uint64(h);
 }
 
@@ -344,6 +344,7 @@ static bool d3d12_pipeline_library_find_internal_blob(struct d3d12_pipeline_libr
     uint32_t checksum;
     bool ret = false;
 
+    /* We are called from within D3D12 PSO creation, and we won't have read locks active here. */
     if (rwlock_lock_read(&pipeline_library->mutex))
         return false;
 
@@ -351,6 +352,7 @@ static bool d3d12_pipeline_library_find_internal_blob(struct d3d12_pipeline_libr
     key.name = NULL;
     key.internal_key_hash = hash;
     entry = (const struct vkd3d_cached_pipeline_entry *)hash_map_find(map, &key);
+
     if (entry)
     {
         internal = entry->data.blob;
@@ -396,6 +398,8 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 
     payload_size = state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data);
     chunk = find_blob_chunk(CONST_CAST_CHUNK_BASE(blob), payload_size, VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE);
+
+    /* Try to find embedded cache first, then attempt to find link references. */
 
     if (chunk)
     {
@@ -542,8 +546,8 @@ static bool d3d12_pipeline_library_insert_hash_map_blob(struct d3d12_pipeline_li
 static size_t vkd3d_shader_code_compute_serialized_size(const struct vkd3d_shader_code *code,
         size_t *out_varint_size, bool inline_spirv)
 {
-    size_t blob_size = 0;
     size_t varint_size = 0;
+    size_t blob_size = 0;
 
     if (code->size && !(code->meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
     {
@@ -607,6 +611,7 @@ static void vkd3d_shader_code_serialize_referenced(struct d3d12_pipeline_library
     struct vkd3d_pipeline_blob_chunk_link *link;
     struct vkd3d_cached_pipeline_entry entry;
     struct vkd3d_shader_code blob;
+    size_t wrapped_varint_size;
 
     if (code->size && !(code->meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
     {
@@ -614,9 +619,8 @@ static void vkd3d_shader_code_serialize_referenced(struct d3d12_pipeline_library
         entry.key.name = NULL;
         entry.data.is_new = true;
 
-        entry.data.blob_length = sizeof(*internal) +
-                sizeof(struct vkd3d_pipeline_blob_chunk_spirv) +
-                varint_size;
+        wrapped_varint_size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size;
+        entry.data.blob_length = sizeof(*internal) + wrapped_varint_size;
         internal = vkd3d_malloc(entry.data.blob_length);
 
         spirv = CAST_CHUNK_DATA(internal, spirv);
@@ -629,8 +633,7 @@ static void vkd3d_shader_code_serialize_referenced(struct d3d12_pipeline_library
         blob.size = varint_size;
         entry.key.internal_key_hash = vkd3d_shader_hash(&blob);
 
-        internal->checksum = vkd3d_pipeline_blob_compute_data_checksum(internal->data,
-                sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size);
+        internal->checksum = vkd3d_pipeline_blob_compute_data_checksum(internal->data, wrapped_varint_size);
 
         /* For duplicate, we won't insert. Just free the blob. */
         if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library,
@@ -918,16 +921,44 @@ struct vkd3d_serialized_pipeline_library
 STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == offsetof(struct vkd3d_serialized_pipeline_library, entries));
 STATIC_ASSERT(sizeof(struct vkd3d_serialized_pipeline_library) == 40 + VK_UUID_SIZE);
 
-/* After entries, name buffers are encoded tightly packed one after the other.
- * For blob data, these are referenced by blob_offset / blob_length.
- * blob_offset is aligned. */
+/* Binary layout:
+ * - Header
+ * - spirv_count x toc_entries [Varint compressed SPIR-V]
+ * - driver_cache_count x toc_entries [VkPipelineCache data]
+ * - pipeline_count x toc_entries [Contains references to SPIR-V and VkPipelineCache blobs]
+ * - After toc entries, raw data is placed. TOC entries refer to keys (names) and values by offsets into this buffer.
+ * - TOC entry offsets for names are implicit. The name lengths are tightly packed from the start of the raw data buffer.
+ *   Name lengths of 0 are treated as u64 hashes. Used for SPIR-V cache and VkPipelineCache cache.
+ *   Name entries are allocated in toc_entry order.
+ * - For blobs, a u64 offset + u32 size pair is added.
+ * - After toc entries, we have the name table.
+ */
+
+/*
+ * A raw blob is treated as a vkd3d_pipeline_blob or vkd3d_pipeline_blob_internal.
+ * The full blob type is used for D3D12 PSOs. These contain:
+ * - Versioning of various kinds. If there is a mismatch we return the appropriate error.
+ * - Checksum is used as sanity check in case we have a corrupt archive.
+ * - Chunked data[].
+ * - This chunked data is a typical stream of { type, length, data }. A D3D12 PSO stores various information here, such as
+ *   - Root signature compatibility
+ *   - SPIR-V shader hash references per stage
+ *   - SPIR-V shader meta information, which is reflection data that we would otherwise get from vkd3d-shader
+ *   - Hash of the VkPipelineCache data
+ */
+
+/*
+ * An internal blob is just checksum + data.
+ * This data does not need versioning information since it's fully internal to the library implementation and is only
+ * referenced after the D3D12 blob header is validated.
+ */
 
 /* Rationale for this split format is:
  * - It is implied that the pipeline library can be used directly from an mmap-ed on-disk file,
  *   since users cannot free the pointer to library once created.
  *   In this situation, we should scan through just the TOC to begin with to avoid page faulting on potentially 100s of MBs.
  *   It is also more cache friendly this way.
- * - Having a more split TOC structure like this will make it easier to add SPIR-V deduplication down the line.
+ * - Having a more split TOC structure like this makes it easier to add SPIR-V deduplication and PSO cache deduplication.
  */
 
 /* ID3D12PipelineLibrary */
