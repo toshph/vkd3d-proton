@@ -440,7 +440,8 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
     {
         for (i = 0; i < state->graphics.stage_count; i++)
         {
-            if (state->graphics.code[i].size)
+            if (state->graphics.code[i].size &&
+                    !(state->graphics.code[i].meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
             {
                 if (need_blob_sizes)
                 {
@@ -470,7 +471,8 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
     }
     else if (d3d12_pipeline_state_is_compute(state))
     {
-        if (state->compute.code.size)
+        if (state->compute.code.size &&
+                !(state->compute.code.meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
         {
             if (need_blob_sizes)
             {
@@ -532,7 +534,8 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
         {
             for (i = 0; i < state->graphics.stage_count; i++)
             {
-                if (state->graphics.code[i].size)
+                if (state->graphics.code[i].size &&
+                        !(state->graphics.code[i].meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
                 {
                     /* Store inline SPIR-V, or (TODO) a link to SPIR-V in pipeline library. */
                     chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
@@ -559,7 +562,8 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
         }
         else if (d3d12_pipeline_state_is_compute(state))
         {
-            if (state->compute.code.size)
+            if (state->compute.code.size &&
+                    !(state->compute.code.meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
             {
                 /* Store inline SPIR-V, or (TODO) a link to SPIR-V in pipeline library. */
                 chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV |
