@@ -419,16 +419,20 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
     const struct vkd3d_pipeline_blob_chunk_shader_meta *meta;
     const struct vkd3d_pipeline_blob_chunk_spirv *spirv;
+    const struct vkd3d_pipeline_blob_chunk_link *link;
     const struct vkd3d_pipeline_blob_chunk *chunk;
     vkd3d_shader_hash_t dxbc_hash;
+    size_t internal_blob_size;
+    size_t payload_size;
     void *duped_code;
 
     if (!state->blob.CachedBlobSizeInBytes)
         return E_FAIL;
 
-    /* Fetch shader meta. */
-    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
-            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+    payload_size = state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data);
+
+    /* Fetch and validate shader meta. */
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data, payload_size,
             VKD3D_PIPELINE_BLOB_CHUNK_TYPE_SHADER_META | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
     if (!chunk || chunk->size != sizeof(*meta))
         return E_FAIL;
@@ -445,14 +449,38 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     }
 
     /* Aim to pull SPIR-V either from inlined chunk, or a link. */
-    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
-            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data, payload_size,
             VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT));
 
-    if (!chunk)
-        return E_FAIL;
+    if (chunk)
+    {
+        spirv = (const struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
+    }
+    else if (state->library && (chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data, payload_size,
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_VARINT_SPIRV_LINK | (stage << VKD3D_PIPELINE_BLOB_CHUNK_INDEX_SHIFT))))
+    {
+        link = (const struct vkd3d_pipeline_blob_chunk_link *)chunk->data;
+        if (!d3d12_pipeline_library_find_internal_blob(state->library, &state->library->spirv_cache_map,
+                link->hash, (const void **)&spirv, &internal_blob_size))
+        {
+            FIXME("Did not find internal SPIR-V reference %016"PRIx64".\n", link->hash);
+            spirv = NULL;
+        }
 
-    spirv = (const struct vkd3d_pipeline_blob_chunk_spirv *)chunk->data;
+        if (spirv)
+        {
+            if (internal_blob_size < sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + spirv->compressed_spirv_size)
+            {
+                FIXME("Unexpected low internal blob size.\n");
+                spirv = NULL;
+            }
+        }
+    }
+    else
+        spirv = NULL;
+
+    if (!spirv)
+        return E_FAIL;
 
     duped_code = vkd3d_malloc(spirv->decompressed_spirv_size);
     if (!duped_code)
