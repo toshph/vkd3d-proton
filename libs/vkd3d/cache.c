@@ -1327,11 +1327,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     const VkPhysicalDeviceProperties *device_properties = &pipeline_library->device->device_info.properties2.properties;
     struct vkd3d_serialized_pipeline_library *header = data;
     struct vkd3d_serialized_pipeline_toc_entry *toc_entries;
+    uint64_t driver_cache_size;
     uint8_t *serialized_data;
     size_t total_toc_entries;
     size_t required_size;
+    uint64_t spirv_size;
     size_t name_offset;
     size_t blob_offset;
+    uint64_t pso_size;
     int rc;
 
     TRACE("iface %p.\n", iface);
@@ -1366,12 +1369,36 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     name_offset = 0;
     blob_offset = d3d12_pipeline_library_get_aligned_name_table_size(pipeline_library);
 
+    spirv_size = blob_offset;
     d3d12_pipeline_library_serialize_hash_map(&pipeline_library->spirv_cache_map, &toc_entries,
             serialized_data, &name_offset, &blob_offset);
+    spirv_size = blob_offset - spirv_size;
+
+    driver_cache_size = blob_offset;
     d3d12_pipeline_library_serialize_hash_map(&pipeline_library->driver_cache_map, &toc_entries,
             serialized_data, &name_offset, &blob_offset);
+    driver_cache_size = blob_offset - driver_cache_size;
+
+    pso_size = blob_offset;
     d3d12_pipeline_library_serialize_hash_map(&pipeline_library->pso_map, &toc_entries,
             serialized_data, &name_offset, &blob_offset);
+    pso_size = blob_offset - pso_size;
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+    {
+        INFO("Serializing pipeline library (%"PRIu64" bytes):\n"
+             "  TOC overhead: %"PRIu64" bytes\n"
+             "  Name table overhead: %"PRIu64" bytes\n"
+             "  D3D12 PSO count: %u (%"PRIu64" bytes)\n"
+             "  Unique SPIR-V count: %u (%"PRIu64" bytes)\n"
+             "  Unique VkPipelineCache count: %u (%"PRIu64" bytes)\n",
+                (uint64_t)data_size,
+                (uint64_t)(serialized_data - (const uint8_t*)data),
+                (uint64_t)name_offset,
+                header->pipeline_count, pso_size,
+                header->spirv_count, spirv_size,
+                header->driver_cache_count, driver_cache_size);
+    }
 
     rwlock_unlock_read(&pipeline_library->mutex);
     return S_OK;
@@ -1495,15 +1522,39 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
      * to rebuild the pipeline library in case vkd3d itself or the
      * underlying device/driver changed */
     if (blob_length < sizeof(*header) || header->version != VKD3D_PIPELINE_LIBRARY_VERSION)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Rejecting pipeline library due to invalid header version.\n");
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
 
     if (header->device_id != device_properties->deviceID || header->vendor_id != device_properties->vendorID)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Rejecting pipeline library due to vendorID/deviceID mismatch.\n");
         return D3D12_ERROR_ADAPTER_NOT_FOUND;
+    }
 
-    if (header->vkd3d_build != vkd3d_build ||
-            header->vkd3d_shader_interface_key != device->shader_interface_key ||
-            memcmp(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
+    if (header->vkd3d_build != vkd3d_build)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Rejecting pipeline library due to vkd3d-proton build mismatch.\n");
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
+
+    if (header->vkd3d_shader_interface_key != device->shader_interface_key)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Rejecting pipeline library due to vkd3d-proton shader interface key mismatch.\n");
+        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
+
+    if (memcmp(header->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Rejecting pipeline library due to pipelineCacheUUID mismatch.\n");
+        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
 
     total_toc_entries = header->pipeline_count + header->spirv_count + header->driver_cache_count;
 
@@ -1511,7 +1562,11 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
             total_toc_entries * sizeof(struct vkd3d_serialized_pipeline_toc_entry);
 
     if (blob_length < header_entry_size)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Rejecting pipeline library due to too small blob length compared to expected size.\n");
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
 
     serialized_data_size = blob_length - header_entry_size;
     serialized_data_base = (const uint8_t *)&header->entries[total_toc_entries];
@@ -1539,6 +1594,18 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
             &name_table)))
         return hr;
     i += header->pipeline_count;
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+    {
+        INFO("Loading pipeline library (%"PRIu64" bytes):\n"
+             "  D3D12 PSO count: %u\n"
+             "  Unique SPIR-V count: %u\n"
+             "  Unique VkPipelineCache count: %u\n",
+                (uint64_t)blob_length,
+                header->pipeline_count,
+                header->spirv_count,
+                header->driver_cache_count);
+    }
 
     return S_OK;
 }
