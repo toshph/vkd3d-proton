@@ -595,7 +595,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"force_host_cached", VKD3D_CONFIG_FLAG_FORCE_HOST_CACHED},
     {"no_invariant_position", VKD3D_CONFIG_FLAG_FORCE_NO_INVARIANT_POSITION},
     {"pipeline_library_no_serialize_spirv", VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV},
-    {"pipeline_library_no_unserialize_spirv", VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_UNSERIALIZE_SPIRV},
+    {"pipeline_library_sanitize_spirv", VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_SANITIZE_SPIRV},
     {"pipeline_library_log", VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG},
 };
 

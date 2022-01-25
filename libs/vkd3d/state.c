@@ -2316,8 +2316,8 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
             INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
     }
 
-    /* For debug/dev purposes, it's useful to force compilation even if we have SPIR-V in cache. */
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_UNSERIALIZE_SPIRV)
+    /* For debug/dev purposes. */
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_SANITIZE_SPIRV)
     {
         if (SUCCEEDED(hr))
         {
