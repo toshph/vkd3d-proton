@@ -21,6 +21,27 @@
 #include "vkd3d_private.h"
 #include "vkd3d_shader.h"
 
+struct vkd3d_cached_pipeline_key
+{
+    size_t name_length;
+    const void *name;
+    uint64_t internal_key_hash; /* Used for internal keys which are just hashes. Used if name_length is 0. */
+};
+
+struct vkd3d_cached_pipeline_data
+{
+    size_t blob_length;
+    const void *blob;
+    bool is_new;
+};
+
+struct vkd3d_cached_pipeline_entry
+{
+    struct hash_map_entry entry;
+    struct vkd3d_cached_pipeline_key key;
+    struct vkd3d_cached_pipeline_data data;
+};
+
 static size_t vkd3d_compute_size_varint(const uint32_t *words, size_t word_count)
 {
     size_t size = 0;
@@ -296,11 +317,57 @@ static struct vkd3d_pipeline_blob_chunk *finish_and_iterate_blob_chunk(struct vk
     return (struct vkd3d_pipeline_blob_chunk *)&chunk->data[aligned_size];
 }
 
+static bool d3d12_pipeline_library_find_internal_blob(struct d3d12_pipeline_library *pipeline_library,
+        const struct hash_map *map, uint64_t hash, const void **data, size_t *size)
+{
+    const struct vkd3d_pipeline_blob_internal *internal;
+    const struct vkd3d_cached_pipeline_entry *entry;
+    struct vkd3d_cached_pipeline_key key;
+    uint32_t checksum;
+    bool ret = false;
+
+    if (rwlock_lock_read(&pipeline_library->mutex))
+        return false;
+
+    key.name_length = 0;
+    key.name = NULL;
+    key.internal_key_hash = hash;
+    entry = (const struct vkd3d_cached_pipeline_entry *)hash_map_find(map, &key);
+    if (entry)
+    {
+        internal = entry->data.blob;
+        if (entry->data.blob_length < sizeof(*internal))
+        {
+            FIXME("Internal blob length is too small.\n");
+            goto out;
+        }
+
+        *data = internal->data;
+        *size = entry->data.blob_length - sizeof(*internal);
+        checksum = vkd3d_pipeline_blob_compute_data_checksum(*data, *size);
+        if (checksum != internal->checksum)
+        {
+            FIXME("Checksum mismatch.\n");
+            goto out;
+        }
+
+        ret = true;
+    }
+
+out:
+    rwlock_unlock_read(&pipeline_library->mutex);
+    return ret;
+}
+
 HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state, VkPipelineCache *cache)
 {
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    const struct vkd3d_pipeline_blob_chunk_link *link;
     const struct vkd3d_pipeline_blob_chunk *chunk;
+    size_t payload_size;
+    const void *data;
+    size_t size;
     VkResult vr;
 
     if (!state->blob.CachedBlobSizeInBytes)
@@ -309,17 +376,35 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
         return hresult_from_vk_result(vr);
     }
 
-    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data,
-            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
+    payload_size = state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data);
+    chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data, payload_size,
             VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE);
 
-    if (!chunk)
+    if (chunk)
     {
-        vr = vkd3d_create_pipeline_cache(device, 0, NULL, cache);
-        return hresult_from_vk_result(vr);
+        data = chunk->data;
+        size = chunk->size;
+    }
+    else if (state->library && (chunk = find_blob_chunk((const struct vkd3d_pipeline_blob_chunk *)blob->data, payload_size,
+            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE_LINK)))
+    {
+        link = (const struct vkd3d_pipeline_blob_chunk_link*)chunk->data;
+
+        if (!d3d12_pipeline_library_find_internal_blob(state->library,
+                &state->library->driver_cache_map, link->hash, &data, &size))
+        {
+            FIXME("Did not find internal PSO cache reference %016"PRIx64".\n", link->hash);
+            data = NULL;
+            size = 0;
+        }
+    }
+    else
+    {
+        data = NULL;
+        size = 0;
     }
 
-    vr = vkd3d_create_pipeline_cache(device, chunk->size, chunk->data, cache);
+    vr = vkd3d_create_pipeline_cache(device, size, data, cache);
     return hresult_from_vk_result(vr);
 }
 
@@ -385,27 +470,6 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
 
     return S_OK;
 }
-
-struct vkd3d_cached_pipeline_key
-{
-    size_t name_length;
-    const void *name;
-    uint64_t internal_key_hash; /* Used for internal keys which are just hashes. Used if name_length is 0. */
-};
-
-struct vkd3d_cached_pipeline_data
-{
-    size_t blob_length;
-    const void *blob;
-    bool is_new;
-};
-
-struct vkd3d_cached_pipeline_entry
-{
-    struct hash_map_entry entry;
-    struct vkd3d_cached_pipeline_key key;
-    struct vkd3d_cached_pipeline_data data;
-};
 
 static uint32_t d3d12_cached_pipeline_entry_name_table_size(const struct vkd3d_cached_pipeline_entry *entry)
 {
