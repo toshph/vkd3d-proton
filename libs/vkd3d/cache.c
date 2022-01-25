@@ -280,11 +280,14 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
     const struct vkd3d_pipeline_blob_chunk_pso_compat *pso_compat;
     const struct vkd3d_pipeline_blob_chunk *chunk;
+    size_t payload_size;
     uint32_t checksum;
 
     /* Avoid E_INVALIDARG with an invalid header size, since that may confuse some games */
     if (state->blob.CachedBlobSizeInBytes < sizeof(*blob) || blob->version != VKD3D_CACHE_BLOB_VERSION)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+
+    payload_size = state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data);
 
     /* Indicate that the cached data is not useful if we're running on a different device or driver */
     if (blob->vendor_id != device_properties->vendorID || blob->device_id != device_properties->deviceID)
@@ -299,8 +302,7 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
             memcmp(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
-    checksum = vkd3d_pipeline_blob_compute_data_checksum(blob->data,
-            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data));
+    checksum = vkd3d_pipeline_blob_compute_data_checksum(blob->data, payload_size);
 
     if (checksum != blob->checksum)
     {
@@ -310,9 +312,7 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
     }
 
     /* Fetch compat info. */
-    chunk = find_blob_chunk(CONST_CAST_CHUNK_BASE(blob),
-            state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data),
-            VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT);
+    chunk = find_blob_chunk(CONST_CAST_CHUNK_BASE(blob), payload_size, VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT);
     if (!chunk || chunk->size != sizeof(*pso_compat))
         return E_FAIL;
     pso_compat = CONST_CAST_CHUNK_DATA(chunk, pso_compat);
