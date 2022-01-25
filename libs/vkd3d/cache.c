@@ -386,6 +386,16 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     return S_OK;
 }
 
+#define VKD3D_PIPELINE_BLOB_CHUNK_SIZE(type) \
+    align(sizeof(struct vkd3d_pipeline_blob_chunk) + sizeof(struct vkd3d_pipeline_blob_chunk_##type), \
+    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)
+#define VKD3D_PIPELINE_BLOB_CHUNK_SIZE_RAW(extra) \
+    align(sizeof(struct vkd3d_pipeline_blob_chunk) + (extra), \
+    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)
+#define VKD3D_PIPELINE_BLOB_CHUNK_SIZE_VARIABLE(type, extra) \
+    align(sizeof(struct vkd3d_pipeline_blob_chunk) + sizeof(struct vkd3d_pipeline_blob_chunk_##type) + (extra), \
+    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN)
+
 static size_t vkd3d_shader_code_compute_serialized_size(const struct vkd3d_shader_code *code,
         size_t *out_varint_size, bool inline_spirv)
 {
@@ -399,21 +409,11 @@ static size_t vkd3d_shader_code_compute_serialized_size(const struct vkd3d_shade
 
         /* If we have a pipeline library, we will store a reference to the SPIR-V instead. */
         if (inline_spirv)
-        {
-            blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                    sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size,
-                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-        }
+            blob_size += VKD3D_PIPELINE_BLOB_CHUNK_SIZE_VARIABLE(spirv, varint_size);
         else
-        {
-            blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                    sizeof(struct vkd3d_pipeline_blob_chunk_link),
-                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-        }
+            blob_size += VKD3D_PIPELINE_BLOB_CHUNK_SIZE(link);
 
-        blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta),
-                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        blob_size += VKD3D_PIPELINE_BLOB_CHUNK_SIZE(shader_meta);
     }
 
     if (out_varint_size)
@@ -442,9 +442,7 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
     need_blob_sizes = !pipeline_library || data;
 
     /* PSO compatibility information is global to a PSO. */
-    vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-            sizeof(struct vkd3d_pipeline_blob_chunk_pso_compat),
-            VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+    vk_blob_size += VKD3D_PIPELINE_BLOB_CHUNK_SIZE(pso_compat);
 
     if (state->vk_pso_cache)
     {
@@ -458,17 +456,9 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
         }
 
         if (pipeline_library)
-        {
-            vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                    sizeof(struct vkd3d_pipeline_blob_chunk_link),
-                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-        }
+            vk_blob_size += VKD3D_PIPELINE_BLOB_CHUNK_SIZE(link);
         else
-        {
-            vk_blob_size += align(vk_blob_size_pipeline_cache +
-                    sizeof(struct vkd3d_pipeline_blob_chunk),
-                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-        }
+            vk_blob_size += VKD3D_PIPELINE_BLOB_CHUNK_SIZE_RAW(vk_blob_size_pipeline_cache);
     }
 
     if (d3d12_pipeline_state_is_graphics(state))
