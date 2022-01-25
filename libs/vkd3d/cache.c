@@ -31,9 +31,9 @@ struct vkd3d_cached_pipeline_key
 
 struct vkd3d_cached_pipeline_data
 {
-    size_t blob_length;
     const void *blob;
-    bool is_new;
+    size_t blob_length;
+    size_t is_new; /* Avoid padding issues. */
 };
 
 struct vkd3d_cached_pipeline_entry
@@ -540,7 +540,7 @@ static bool d3d12_pipeline_library_insert_hash_map_blob(struct d3d12_pipeline_li
 {
     const struct vkd3d_cached_pipeline_entry *new_entry;
     if ((new_entry = (const struct vkd3d_cached_pipeline_entry*)hash_map_insert(map, &entry->key, &entry->entry)) &&
-            memcmp(&new_entry->data, &entry->data, sizeof(entry->data)) == 0)
+            new_entry->data.blob == entry->data.blob)
     {
         pipeline_library->total_name_table_size += d3d12_cached_pipeline_entry_name_table_size(entry);
         pipeline_library->total_blob_size += align(entry->data.blob_length, VKD3D_PIPELINE_BLOB_ALIGN);
@@ -624,7 +624,7 @@ static void vkd3d_shader_code_serialize_referenced(struct d3d12_pipeline_library
     {
         entry.key.name_length = 0;
         entry.key.name = NULL;
-        entry.data.is_new = true;
+        entry.data.is_new = 1;
 
         wrapped_varint_size = sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size;
         entry.data.blob_length = sizeof(*internal) + wrapped_varint_size;
@@ -718,7 +718,7 @@ static VkResult vkd3d_serialize_pipeline_state_referenced(struct d3d12_pipeline_
 
     entry.key.name_length = 0;
     entry.key.name = NULL;
-    entry.data.is_new = true;
+    entry.data.is_new = 1;
 
     if (state->vk_pso_cache)
     {
@@ -1172,7 +1172,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     }
 
     entry.data.blob = new_blob;
-    entry.data.is_new = true;
+    entry.data.is_new = 1;
 
     if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library, &pipeline_library->pso_map, &entry))
     {
@@ -1502,7 +1502,7 @@ static HRESULT d3d12_pipeline_library_unserialize_hash_map(
 
         entry.data.blob_length = toc_entry->blob_length;
         entry.data.blob = serialized_data_base + toc_entry->blob_offset;
-        entry.data.is_new = false;
+        entry.data.is_new = 0;
 
         if (!d3d12_pipeline_library_insert_hash_map_blob(pipeline_library, map, &entry))
             return E_OUTOFMEMORY;
