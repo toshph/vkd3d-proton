@@ -262,6 +262,7 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
 {
     const VkPhysicalDeviceProperties *device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
+    const struct vkd3d_pipeline_blob_chunk_pso_compat *pso_compat;
     const struct vkd3d_pipeline_blob_chunk *chunk;
     uint32_t checksum;
 
@@ -298,9 +299,10 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
             VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT);
     if (!chunk || chunk->size != sizeof(root_signature_compat_hash))
         return E_FAIL;
+    pso_compat = (const struct vkd3d_pipeline_blob_chunk_pso_compat*)chunk->data;
 
     /* Verify the expected root signature that was used to generate the SPIR-V. */
-    if (memcmp(&root_signature_compat_hash, chunk->data, chunk->size) != 0)
+    if (root_signature_compat_hash != pso_compat->root_signature_compat_hash)
     {
         WARN("Root signature compatibility hash mismatch.\n");
         return E_INVALIDARG;
