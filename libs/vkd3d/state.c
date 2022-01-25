@@ -3970,6 +3970,14 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     else
         d3d12_pipeline_state_destroy_shader_modules(object, device);
 
+    /* We don't expect to serialize the PSO blob if we loaded it from cache.
+     * Free the cache now to save on memory. */
+    if (desc->cached_pso.blob.CachedBlobSizeInBytes)
+    {
+        VK_CALL(vkDestroyPipelineCache(device->vk_device, object->vk_pso_cache, NULL));
+        object->vk_pso_cache = VK_NULL_HANDLE;
+    }
+
     TRACE("Created pipeline state %p.\n", object);
 
     *state = object;
