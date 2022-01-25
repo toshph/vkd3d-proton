@@ -2295,37 +2295,43 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
 
-    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_IGNORE_SPIRV))
     {
-        if (SUCCEEDED(hr))
-        {
-            INFO("SPIR-V (stage: %x) for blob hash %016"PRIx64" received from cached pipeline state.\n",
-                    stage, spirv_code->meta.hash);
-        }
-        else if (hr == E_FAIL)
-        {
-            if (cached_state->blob.CachedBlobSizeInBytes)
-                INFO("SPIR-V chunk was not found in cached PSO state.\n");
-            else
-                INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
-        }
-        else if (hr == E_INVALIDARG)
-            INFO("Pipeline could not be created to mismatch in either root signature or DXBC blobs.\n");
-        else
-            INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
-    }
+        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
 
-    /* For debug/dev purposes. */
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_SANITIZE_SPIRV)
-    {
-        if (SUCCEEDED(hr))
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
         {
-            recovered_hash = vkd3d_shader_hash(spirv_code);
-            vkd3d_shader_free_shader_code(spirv_code);
+            if (SUCCEEDED(hr))
+            {
+                INFO("SPIR-V (stage: %x) for blob hash %016"PRIx64" received from cached pipeline state.\n",
+                        stage, spirv_code->meta.hash);
+            }
+            else if (hr == E_FAIL)
+            {
+                if (cached_state->blob.CachedBlobSizeInBytes)
+                    INFO("SPIR-V chunk was not found in cached PSO state.\n");
+                else
+                    INFO("SPIR-V chunk was not found due to no Cached PSO state being provided.\n");
+            }
+            else if (hr == E_INVALIDARG)
+                INFO("Pipeline could not be created to mismatch in either root signature or DXBC blobs.\n");
+            else
+                INFO("Unexpected error when unserializing SPIR-V (hr %x).\n", hr);
         }
-        hr = E_FAIL;
+
+        /* For debug/dev purposes. */
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_SANITIZE_SPIRV)
+        {
+            if (SUCCEEDED(hr))
+            {
+                recovered_hash = vkd3d_shader_hash(spirv_code);
+                vkd3d_shader_free_shader_code(spirv_code);
+            }
+            hr = E_FAIL;
+        }
     }
+    else
+        hr = E_FAIL;
 
     if (FAILED(hr))
     {
