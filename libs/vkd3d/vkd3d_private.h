@@ -1508,6 +1508,14 @@ struct d3d12_compute_pipeline_state
     struct vkd3d_shader_code code;
 };
 
+/* To be able to load a pipeline from cache, this information must match exactly,
+ * otherwise, we must regard the PSO as incompatible (which is invalid usage and must be validated). */
+struct vkd3d_pipeline_cache_compatibility
+{
+    uint64_t root_signature_compat_hash;
+    uint64_t dxbc_blob_hashes[VKD3D_MAX_SHADER_STAGES];
+};
+
 /* ID3D12PipelineState */
 struct d3d12_pipeline_state
 {
@@ -1523,7 +1531,7 @@ struct d3d12_pipeline_state
     VkPipelineCache vk_pso_cache;
     spinlock_t lock;
 
-    vkd3d_shader_hash_t root_signature_compat_hash;
+    struct vkd3d_pipeline_cache_compatibility pipeline_cache_compat;
     ID3D12RootSignature *private_root_signature;
     struct d3d12_device *device;
 
@@ -1670,7 +1678,7 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
         const struct d3d12_pipeline_state *state, size_t *size, void *data);
 HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state,
-        vkd3d_shader_hash_t root_signature_compat_hash);
+        const struct vkd3d_pipeline_cache_compatibility *compat);
 
 struct vkd3d_buffer
 {

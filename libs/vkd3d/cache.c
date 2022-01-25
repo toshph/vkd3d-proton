@@ -212,7 +212,7 @@ struct vkd3d_pipeline_blob_chunk_shader_meta
 
 struct vkd3d_pipeline_blob_chunk_pso_compat
 {
-    uint64_t root_signature_compat_hash;
+    struct vkd3d_pipeline_cache_compatibility compat;
 };
 
 STATIC_ASSERT(sizeof(struct vkd3d_pipeline_blob_chunk) == 8);
@@ -274,7 +274,7 @@ static const struct vkd3d_pipeline_blob_chunk *find_blob_chunk(const struct vkd3
 
 HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state,
-        vkd3d_shader_hash_t root_signature_compat_hash)
+        const struct vkd3d_pipeline_cache_compatibility *compat)
 {
     const VkPhysicalDeviceProperties *device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
@@ -318,9 +318,16 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
     pso_compat = CONST_CAST_CHUNK_DATA(chunk, pso_compat);
 
     /* Verify the expected root signature that was used to generate the SPIR-V. */
-    if (root_signature_compat_hash != pso_compat->root_signature_compat_hash)
+    if (compat->root_signature_compat_hash != pso_compat->compat.root_signature_compat_hash)
     {
         WARN("Root signature compatibility hash mismatch.\n");
+        return E_INVALIDARG;
+    }
+
+    /* Verify that DXBC shader blobs match. */
+    if (memcmp(compat->dxbc_blob_hashes, pso_compat->compat.dxbc_blob_hashes, sizeof(compat->dxbc_blob_hashes)) != 0)
+    {
+        WARN("DXBC blob hash mismatch.\n");
         return E_INVALIDARG;
     }
 
@@ -835,7 +842,7 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
         chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PSO_COMPAT;
         chunk->size = sizeof(*pso_compat);
         pso_compat = CAST_CHUNK_DATA(chunk, pso_compat);
-        pso_compat->root_signature_compat_hash = state->root_signature_compat_hash;
+        pso_compat->compat = state->pipeline_cache_compat;
         chunk = finish_and_iterate_blob_chunk(chunk);
 
         if (pipeline_library)
