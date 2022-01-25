@@ -386,6 +386,41 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
     return S_OK;
 }
 
+static size_t vkd3d_shader_code_compute_serialized_size(const struct vkd3d_shader_code *code,
+        size_t *out_varint_size, bool inline_spirv)
+{
+    size_t blob_size = 0;
+    size_t varint_size = 0;
+
+    if (code->size && !(code->meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
+    {
+        if (out_varint_size || inline_spirv)
+            varint_size = vkd3d_compute_size_varint(code->code, code->size / sizeof(uint32_t));
+
+        /* If we have a pipeline library, we will store a reference to the SPIR-V instead. */
+        if (inline_spirv)
+        {
+            blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                    sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size,
+                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        }
+        else
+        {
+            blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                    sizeof(struct vkd3d_pipeline_blob_chunk_link),
+                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+        }
+
+        blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
+                sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta),
+                VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
+    }
+
+    if (out_varint_size)
+        *out_varint_size = varint_size;
+    return blob_size;
+}
+
 VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_library,
         const struct d3d12_pipeline_state *state, size_t *size, void *data)
 {
@@ -440,63 +475,14 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
     {
         for (i = 0; i < state->graphics.stage_count; i++)
         {
-            if (state->graphics.code[i].size &&
-                    !(state->graphics.code[i].meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
-            {
-                if (need_blob_sizes)
-                {
-                    varint_size[i] = vkd3d_compute_size_varint(state->graphics.code[i].code,
-                            state->graphics.code[i].size / sizeof(uint32_t));
-                }
-
-                /* If we have a pipeline library, we will store a reference to the SPIR-V instead. */
-                if (pipeline_library)
-                {
-                    vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                            sizeof(struct vkd3d_pipeline_blob_chunk_link),
-                            VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-                }
-                else
-                {
-                    vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                            sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[i],
-                            VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-                }
-
-                vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                        sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta),
-                        VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-            }
+            vk_blob_size += vkd3d_shader_code_compute_serialized_size(&state->graphics.code[i],
+                    need_blob_sizes ? &varint_size[i] : NULL, !pipeline_library);
         }
     }
     else if (d3d12_pipeline_state_is_compute(state))
     {
-        if (state->compute.code.size &&
-                !(state->compute.code.meta.flags & VKD3D_SHADER_META_FLAG_REPLACED))
-        {
-            if (need_blob_sizes)
-            {
-                varint_size[0] = vkd3d_compute_size_varint(state->compute.code.code,
-                        state->compute.code.size / sizeof(uint32_t));
-            }
-
-            if (pipeline_library)
-            {
-                vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                        sizeof(struct vkd3d_pipeline_blob_chunk_link),
-                        VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-            }
-            else
-            {
-                vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                        sizeof(struct vkd3d_pipeline_blob_chunk_spirv) + varint_size[0],
-                        VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-            }
-
-            vk_blob_size += align(sizeof(struct vkd3d_pipeline_blob_chunk) +
-                    sizeof(struct vkd3d_pipeline_blob_chunk_shader_meta),
-                    VKD3D_PIPELINE_BLOB_CHUNK_ALIGN);
-        }
+        vk_blob_size += vkd3d_shader_code_compute_serialized_size(&state->compute.code,
+                need_blob_sizes ? &varint_size[0] : NULL, !pipeline_library);
     }
 
     total_size += vk_blob_size;
