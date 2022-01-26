@@ -399,6 +399,8 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 
     if (!state->blob.CachedBlobSizeInBytes)
     {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("No PSO cache was provided, creating empty pipeline cache.\n");
         vr = vkd3d_create_pipeline_cache(device, 0, NULL, cache);
         return hresult_from_vk_result(vr);
     }
@@ -421,7 +423,9 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
         if (!d3d12_pipeline_library_find_internal_blob(state->library,
                 &state->library->driver_cache_map, link->hash, &data, &size))
         {
-            FIXME("Did not find internal PSO cache reference %016"PRIx64".\n", link->hash);
+            if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+                INFO("Did not find internal PSO cache reference %016"PRIx64".\n", link->hash);
+
             data = NULL;
             size = 0;
         }
