@@ -441,13 +441,11 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         VkShaderStageFlagBits stage,
         struct vkd3d_shader_code *spirv_code)
 {
-    const struct vkd3d_shader_code dxbc = { code->pShaderBytecode, code->BytecodeLength };
     const struct vkd3d_pipeline_blob *blob = state->blob.pCachedBlob;
     const struct vkd3d_pipeline_blob_chunk_shader_meta *meta;
     const struct vkd3d_pipeline_blob_chunk_spirv *spirv;
     const struct vkd3d_pipeline_blob_chunk_link *link;
     const struct vkd3d_pipeline_blob_chunk *chunk;
-    vkd3d_shader_hash_t dxbc_hash;
     size_t internal_blob_size;
     size_t payload_size;
     void *duped_code;
@@ -464,15 +462,6 @@ HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
         return E_FAIL;
     meta = CONST_CAST_CHUNK_DATA(chunk, shader_meta);
     memcpy(&spirv_code->meta, &meta->meta, sizeof(meta->meta));
-
-    /* Verify that DXBC blob hash matches with what we expect. */
-    dxbc_hash = vkd3d_shader_hash(&dxbc);
-    if (dxbc_hash != spirv_code->meta.hash)
-    {
-        WARN("DXBC blob hash in CreatePSO state (%016"PRIx64") does not match expected hash (%016"PRIx64".\n",
-                dxbc_hash, spirv_code->meta.hash);
-        return E_INVALIDARG;
-    }
 
     /* Aim to pull SPIR-V either from inlined chunk, or a link. */
     chunk = find_blob_chunk(CONST_CAST_CHUNK_BASE(blob), payload_size,
