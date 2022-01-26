@@ -671,6 +671,7 @@ static VkResult vkd3d_serialize_pipeline_state_inline(const struct d3d12_pipelin
         struct vkd3d_pipeline_blob_chunk *chunk, size_t vk_pipeline_cache_size, const size_t *varint_size)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
+    size_t reference_size;
     unsigned int i;
     VkResult vr;
 
@@ -679,11 +680,23 @@ static VkResult vkd3d_serialize_pipeline_state_inline(const struct d3d12_pipelin
         /* Store PSO cache, or link to it if using pipeline cache. */
         chunk->type = VKD3D_PIPELINE_BLOB_CHUNK_TYPE_PIPELINE_CACHE;
         chunk->size = vk_pipeline_cache_size;
+        reference_size = vk_pipeline_cache_size;
+        /* In case driver leaves uninitialized memory for blob data. */
+        memset(chunk->data, 0, vk_pipeline_cache_size);
         if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache,
-                &vk_pipeline_cache_size, chunk->data))))
+                &reference_size, chunk->data))))
         {
+            FIXME("Failed to serialize pipeline cache data, vr %d.\n", vr);
             return vr;
         }
+
+        if (reference_size != vk_pipeline_cache_size)
+        {
+            FIXME("Mismatch in size for pipeline cache data %u != %u.\n",
+                    (unsigned int)reference_size,
+                    (unsigned int)vk_pipeline_cache_size);
+        }
+
         chunk = finish_and_iterate_blob_chunk(chunk);
     }
 
@@ -713,6 +726,7 @@ static VkResult vkd3d_serialize_pipeline_state_referenced(struct d3d12_pipeline_
     struct vkd3d_pipeline_blob_chunk_link *link;
     struct vkd3d_cached_pipeline_entry entry;
     struct vkd3d_shader_code blob;
+    size_t reference_size;
     unsigned int i;
     VkResult vr;
 
@@ -726,10 +740,21 @@ static VkResult vkd3d_serialize_pipeline_state_referenced(struct d3d12_pipeline_
         internal = vkd3d_malloc(entry.data.blob_length);
         entry.data.blob = internal;
 
+        reference_size = vk_pipeline_cache_size;
+        /* In case driver leaves uninitialized memory for blob data. */
+        memset(internal->data, 0, vk_pipeline_cache_size);
         if ((vr = VK_CALL(vkGetPipelineCacheData(state->device->vk_device, state->vk_pso_cache,
-                &vk_pipeline_cache_size, internal->data))))
+                &reference_size, internal->data))))
         {
+            FIXME("Failed to serialize pipeline cache data, vr %d.\n", vr);
             return vr;
+        }
+
+        if (reference_size != vk_pipeline_cache_size)
+        {
+            FIXME("Mismatch in size for pipeline cache data %u != %u.\n",
+                    (unsigned int)reference_size,
+                    (unsigned int)vk_pipeline_cache_size);
         }
 
         blob.code = internal->data;
