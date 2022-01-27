@@ -457,7 +457,7 @@ HRESULT vkd3d_create_pipeline_cache_from_d3d12_desc(struct d3d12_device *device,
 }
 
 HRESULT vkd3d_get_cached_spirv_code_from_d3d12_desc(
-        const D3D12_SHADER_BYTECODE *code, const struct d3d12_cached_pipeline_state *state,
+        const struct d3d12_cached_pipeline_state *state,
         VkShaderStageFlagBits stage,
         struct vkd3d_shader_code *spirv_code)
 {

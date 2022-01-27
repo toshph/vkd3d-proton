@@ -2297,7 +2297,7 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
 
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_IGNORE_SPIRV))
     {
-        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(code, cached_state, stage, spirv_code);
+        hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(cached_state, stage, spirv_code);
 
         if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
         {
