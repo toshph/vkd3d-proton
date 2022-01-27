@@ -320,21 +320,30 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
     /* Verify the expected PSO state that was used. This must match, or we have to fail compilation as per API spec. */
     if (compat->state_desc_compat_hash != pso_compat->compat.state_desc_compat_hash)
     {
-        WARN("PSO compatibility hash mismatch.\n");
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("PSO compatibility hash mismatch.\n");
+        else
+            WARN("PSO compatibility hash mismatch.\n");
         return E_INVALIDARG;
     }
 
     /* Verify the expected root signature that was used to generate the SPIR-V. */
     if (compat->root_signature_compat_hash != pso_compat->compat.root_signature_compat_hash)
     {
-        WARN("Root signature compatibility hash mismatch.\n");
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Root signature compatibility hash mismatch.\n");
+        else
+            WARN("Root signature compatibility hash mismatch.\n");
         return E_INVALIDARG;
     }
 
     /* Verify that DXBC shader blobs match. */
     if (memcmp(compat->dxbc_blob_hashes, pso_compat->compat.dxbc_blob_hashes, sizeof(compat->dxbc_blob_hashes)) != 0)
     {
-        WARN("DXBC blob hash mismatch.\n");
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("DXBC blob hash mismatch.\n");
+        else
+            WARN("DXBC blob hash mismatch.\n");
         return E_INVALIDARG;
     }
 
