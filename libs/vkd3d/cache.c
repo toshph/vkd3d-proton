@@ -22,6 +22,18 @@
 #include "vkd3d_private.h"
 #include "vkd3d_shader.h"
 
+/* For disk cache. */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <errno.h>
+#endif
+#include <stdio.h>
+
 struct vkd3d_cached_pipeline_key
 {
     size_t name_length;
@@ -1095,7 +1107,9 @@ static ULONG STDMETHODCALLTYPE d3d12_pipeline_library_Release(d3d12_pipeline_lib
     if (!refcount)
     {
         d3d12_pipeline_library_cleanup(pipeline_library, pipeline_library->device);
-        d3d12_device_release(pipeline_library->device);
+        /* Avoid reference cycle if this is a driver-internal pipeline cache. */
+        if (!pipeline_library->internal_driver_cache)
+            d3d12_device_release(pipeline_library->device);
         vkd3d_free(pipeline_library);
     }
 
@@ -1142,6 +1156,91 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_GetDevice(d3d12_pipeline
     TRACE("iface %p, iid %s, device %p.\n", iface, debugstr_guid(iid), device);
 
     return d3d12_device_query_interface(pipeline_library->device, iid, device);
+}
+
+static uint64_t vkd3d_pipeline_cache_compatibility_condense(const struct vkd3d_pipeline_cache_compatibility *compat)
+{
+    unsigned int i;
+    uint64_t h;
+
+    h = hash_fnv1_init();
+    h = hash_fnv1_iterate_u64(h, compat->state_desc_compat_hash);
+    h = hash_fnv1_iterate_u64(h, compat->root_signature_compat_hash);
+    for (i = 0; i < ARRAY_SIZE(compat->dxbc_blob_hashes); i++)
+        h = hash_fnv1_iterate_u64(h, compat->dxbc_blob_hashes[i]);
+    return h;
+}
+
+HRESULT vkd3d_pipeline_library_store_pipeline_to_disk_cache(
+        struct vkd3d_pipeline_library_disk_cache *cache,
+        const struct vkd3d_pipeline_cache_compatibility *compat,
+        struct d3d12_pipeline_state *state)
+{
+    struct d3d12_pipeline_library *library = cache->library;
+    struct vkd3d_cached_pipeline_entry entry;
+    void *new_blob;
+    VkResult vr;
+    int rc;
+
+    entry.key.name_length = 0;
+    entry.key.name = NULL;
+    entry.key.internal_key_hash = vkd3d_pipeline_cache_compatibility_condense(compat);
+
+    if ((rc = rwlock_lock_write(&library->mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        return hresult_from_errno(rc);
+    }
+
+    if (hash_map_find(&library->pso_map, &entry.key))
+    {
+        /* This could happen if a parallel thread tried to create the same PSO.
+         * In a single threaded scenario we would find the PSO when creating the PSO,
+         * and we would never try to enter this path. */
+        WARN("Pipeline key 0x%"PRIx64" already exists. Likely the same PSO was recorded in parallel by other thread.\n",
+                entry.key.internal_key_hash);
+        rwlock_unlock_write(&library->mutex);
+        return E_INVALIDARG;
+    }
+
+    if (FAILED(vr = vkd3d_serialize_pipeline_state(library, state, &entry.data.blob_length, NULL)))
+    {
+        rwlock_unlock_write(&library->mutex);
+        return hresult_from_vk_result(vr);
+    }
+
+    if (!(new_blob = malloc(entry.data.blob_length)))
+    {
+        rwlock_unlock_write(&library->mutex);
+        return E_OUTOFMEMORY;
+    }
+
+    if (FAILED(vr = vkd3d_serialize_pipeline_state(library, state, &entry.data.blob_length, new_blob)))
+    {
+        vkd3d_free(new_blob);
+        rwlock_unlock_write(&library->mutex);
+        return hresult_from_vk_result(vr);
+    }
+
+    entry.data.blob = new_blob;
+    entry.data.is_new = 1;
+
+    if (!d3d12_pipeline_library_insert_hash_map_blob(library, &library->pso_map, &entry))
+    {
+        vkd3d_free(new_blob);
+        rwlock_unlock_write(&library->mutex);
+        return E_OUTOFMEMORY;
+    }
+
+    rwlock_unlock_write(&library->mutex);
+
+    /* Notify disk cache thread. */
+    pthread_mutex_lock(&cache->lock);
+    cache->internal_driver_cache_dirty = true;
+    condvar_reltime_signal(&cache->cond);
+    pthread_mutex_unlock(&cache->lock);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipeline_library_iface *iface,
@@ -1217,6 +1316,38 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_StorePipeline(d3d12_pipe
     }
 
     rwlock_unlock_write(&pipeline_library->mutex);
+    return S_OK;
+}
+
+HRESULT vkd3d_pipeline_library_find_cached_blob_from_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
+        const struct vkd3d_pipeline_cache_compatibility *compat,
+        struct d3d12_cached_pipeline_state *cached_state)
+{
+    struct d3d12_pipeline_library *library = cache->library;
+    const struct vkd3d_cached_pipeline_entry *e;
+    struct vkd3d_cached_pipeline_key key;
+    int rc;
+
+    if ((rc = rwlock_lock_read(&library->mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        return hresult_from_errno(rc);
+    }
+
+    key.name_length = 0;
+    key.name = NULL;
+    key.internal_key_hash = vkd3d_pipeline_cache_compatibility_condense(compat);
+
+    if (!(e = (const struct vkd3d_cached_pipeline_entry*)hash_map_find(&library->pso_map, &key)))
+    {
+        rwlock_unlock_read(&library->mutex);
+        return E_INVALIDARG;
+    }
+
+    cached_state->blob.CachedBlobSizeInBytes = e->data.blob_length;
+    cached_state->blob.pCachedBlob = e->data.blob;
+    cached_state->library = library;
+    rwlock_unlock_read(&library->mutex);
     return S_OK;
 }
 
@@ -1361,10 +1492,9 @@ static void d3d12_pipeline_library_serialize_hash_map(const struct hash_map *map
     *inout_blob_offset = blob_offset;
 }
 
-static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline_library_iface *iface,
-        void *data, SIZE_T data_size)
+static HRESULT d3d12_pipeline_library_serialize(struct d3d12_pipeline_library *pipeline_library,
+        void *data, size_t data_size)
 {
-    struct d3d12_pipeline_library *pipeline_library = impl_from_ID3D12PipelineLibrary(iface);
     const VkPhysicalDeviceProperties *device_properties = &pipeline_library->device->device_info.properties2.properties;
     struct vkd3d_serialized_pipeline_library *header = data;
     struct vkd3d_serialized_pipeline_toc_entry *toc_entries;
@@ -1376,22 +1506,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     size_t name_offset;
     size_t blob_offset;
     uint64_t pso_size;
-    int rc;
-
-    TRACE("iface %p.\n", iface);
-
-    if ((rc = rwlock_lock_read(&pipeline_library->mutex)))
-    {
-        ERR("Failed to lock mutex, rc %d.\n", rc);
-        return 0;
-    }
 
     required_size = d3d12_pipeline_library_get_serialized_size(pipeline_library);
     if (data_size < required_size)
-    {
-        rwlock_unlock_read(&pipeline_library->mutex);
         return E_INVALIDARG;
-    }
 
     header->version = VKD3D_PIPELINE_LIBRARY_VERSION;
     header->vendor_id = device_properties->vendorID;
@@ -1428,21 +1546,40 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
         INFO("Serializing pipeline library (%"PRIu64" bytes):\n"
-             "  TOC overhead: %"PRIu64" bytes\n"
-             "  Name table overhead: %"PRIu64" bytes\n"
-             "  D3D12 PSO count: %u (%"PRIu64" bytes)\n"
-             "  Unique SPIR-V count: %u (%"PRIu64" bytes)\n"
-             "  Unique VkPipelineCache count: %u (%"PRIu64" bytes)\n",
-                (uint64_t)data_size,
-                (uint64_t)(serialized_data - (const uint8_t*)data),
-                (uint64_t)name_offset,
-                header->pipeline_count, pso_size,
-                header->spirv_count, spirv_size,
-                header->driver_cache_count, driver_cache_size);
+            "  TOC overhead: %"PRIu64" bytes\n"
+            "  Name table overhead: %"PRIu64" bytes\n"
+            "  D3D12 PSO count: %u (%"PRIu64" bytes)\n"
+            "  Unique SPIR-V count: %u (%"PRIu64" bytes)\n"
+            "  Unique VkPipelineCache count: %u (%"PRIu64" bytes)\n",
+            (uint64_t)data_size,
+            (uint64_t)(serialized_data - (const uint8_t*)data),
+            (uint64_t)name_offset,
+            header->pipeline_count, pso_size,
+            header->spirv_count, spirv_size,
+            header->driver_cache_count, driver_cache_size);
     }
 
-    rwlock_unlock_read(&pipeline_library->mutex);
     return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_Serialize(d3d12_pipeline_library_iface *iface,
+        void *data, SIZE_T data_size)
+{
+    struct d3d12_pipeline_library *pipeline_library = impl_from_ID3D12PipelineLibrary(iface);
+    HRESULT hr;
+    int rc;
+
+    TRACE("iface %p.\n", iface);
+
+    if ((rc = rwlock_lock_read(&pipeline_library->mutex)))
+    {
+        ERR("Failed to lock mutex, rc %d.\n", rc);
+        return E_FAIL;
+    }
+
+    hr = d3d12_pipeline_library_serialize(pipeline_library, data, data_size);
+    rwlock_unlock_read(&pipeline_library->mutex);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_pipeline_library_LoadPipeline(d3d12_pipeline_library_iface *iface,
@@ -1652,7 +1789,7 @@ static HRESULT d3d12_pipeline_library_read_blob(struct d3d12_pipeline_library *p
 }
 
 static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeline_library,
-        struct d3d12_device *device, const void *blob, size_t blob_length)
+        struct d3d12_device *device, const void *blob, size_t blob_length, bool internal_driver_cache)
 {
     HRESULT hr;
     int rc;
@@ -1671,8 +1808,10 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
             vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
     hash_map_init(&pipeline_library->driver_cache_map, vkd3d_cached_pipeline_hash_internal,
             vkd3d_cached_pipeline_compare_internal, sizeof(struct vkd3d_cached_pipeline_entry));
-    hash_map_init(&pipeline_library->pso_map, vkd3d_cached_pipeline_hash_name,
-            vkd3d_cached_pipeline_compare_name, sizeof(struct vkd3d_cached_pipeline_entry));
+    hash_map_init(&pipeline_library->pso_map,
+            internal_driver_cache ? vkd3d_cached_pipeline_hash_internal : vkd3d_cached_pipeline_hash_name,
+            internal_driver_cache ? vkd3d_cached_pipeline_compare_internal : vkd3d_cached_pipeline_compare_name,
+            sizeof(struct vkd3d_cached_pipeline_entry));
 
     if (blob_length)
     {
@@ -1683,7 +1822,11 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
     if (FAILED(hr = vkd3d_private_store_init(&pipeline_library->private_store)))
         goto cleanup_mutex;
 
-    d3d12_device_add_ref(pipeline_library->device = device);
+    pipeline_library->device = device;
+    pipeline_library->internal_driver_cache = internal_driver_cache;
+    /* Avoid reference cycle if this is a driver-internal pipeline cache. */
+    if (!internal_driver_cache)
+        d3d12_device_add_ref(pipeline_library->device);
     return hr;
 
 cleanup_hash_map:
@@ -1696,7 +1839,8 @@ cleanup_mutex:
 }
 
 HRESULT d3d12_pipeline_library_create(struct d3d12_device *device, const void *blob,
-        size_t blob_length, struct d3d12_pipeline_library **pipeline_library)
+        size_t blob_length, bool internal_driver_cache,
+        struct d3d12_pipeline_library **pipeline_library)
 {
     struct d3d12_pipeline_library *object;
     HRESULT hr;
@@ -1704,7 +1848,7 @@ HRESULT d3d12_pipeline_library_create(struct d3d12_device *device, const void *b
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d3d12_pipeline_library_init(object, device, blob, blob_length)))
+    if (FAILED(hr = d3d12_pipeline_library_init(object, device, blob, blob_length, internal_driver_cache)))
     {
         vkd3d_free(object);
         return hr;
@@ -1857,4 +2001,364 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
             output_index++;
         }
     }
+}
+
+static void *vkd3d_pipeline_library_disk_thread_main(void *userarg);
+
+HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
+        struct d3d12_device *device)
+{
+#ifdef _WIN32
+    HANDLE file_mapping = INVALID_HANDLE_VALUE;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    DWORD size_hi, size_lo;
+    size_t i, n;
+#else
+    struct stat stat_buf;
+    int fd = -1;
+#endif
+
+    unsigned int tid;
+    unsigned int pid;
+    const char *path;
+    HRESULT hr;
+    int rc;
+
+    memset(cache, 0, sizeof(*cache));
+    path = getenv("VKD3D_SHADER_CACHE");
+
+    if (path)
+        INFO("Attempting to load disk cache from %s.\n", path);
+    else
+        return S_OK;
+
+#ifdef _WIN32
+    pid = GetCurrentProcessId();
+    /* Wine has some curious bugs when it comes to MoveFileA, DeleteFileA and RenameFileA.
+     * RenameFileA only works if we use Windows style paths with back-slashes (not forward slashes) for whatever reason.
+     * Manually remap Unix style paths to conservative Win32.
+     * Normally Wine accept Unix style paths, but not here for whatever reason. */
+    if (path[0] == '/')
+        snprintf(cache->path, sizeof(cache->path), "Z:\\%s", path + 1);
+    else
+        snprintf(cache->path, sizeof(cache->path), "%s", path);
+
+    for (i = 0, n = strlen(cache->path); i < n; i++)
+        if (cache->path[i] == '/')
+            cache->path[i] = '\\';
+    INFO("Remapping VKD3D_SHADER_CACHE to %s.\n", cache->path);
+#else
+    /* strncpy is ... quirky :). Just use snprintf. */
+    snprintf(cache->path, sizeof(cache->path), "%s", path);
+    pid = getpid();
+#endif
+    tid = vkd3d_get_current_thread_id();
+
+    /* Use atomic file updates.
+     * Create a temporary file, and then replace the existing cache by renaming.
+     * This makes sure we get atomic updates even if multiple processes attempt to update
+     * the cache at the same time. */
+    snprintf(cache->tmp_path, sizeof(cache->tmp_path), "%s.%u.%u", cache->path, pid, tid);
+
+#ifdef _WIN32
+    handle = CreateFileA(cache->path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            INVALID_HANDLE_VALUE);
+    if (handle == INVALID_HANDLE_VALUE)
+        goto out;
+
+    size_lo = GetFileSize(handle, &size_hi);
+    cache->mapped_size = size_lo | (((uint64_t)size_hi) << 32);
+
+    file_mapping = CreateFileMappingA(handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (file_mapping == INVALID_HANDLE_VALUE)
+        goto out;
+
+    cache->mapped = MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, cache->mapped_size);
+    CloseHandle(file_mapping);
+    file_mapping = INVALID_HANDLE_VALUE;
+    if (!cache->mapped)
+    {
+        ERR("Failed to MapViewOfFile for %s.\n", path);
+        goto out;
+    }
+#else
+    fd = open(cache->path, O_RDONLY);
+    if (fd < 0)
+        goto out;
+
+    if (fstat(fd, &stat_buf) < 0)
+    {
+        ERR("Failed to fstat pipeline cache.\n");
+        goto out;
+    }
+
+    /* Map private to make sure we get CoW behavior in case someone clobbers
+     * the cache while in flight. We need to read data directly out of the cache. */
+    cache->mapped = mmap(NULL, stat_buf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (cache->mapped != MAP_FAILED)
+    {
+        cache->mapped_size = stat_buf.st_size;
+    }
+    else
+    {
+        cache->mapped = NULL;
+        ERR("Failed to mmap file %s.\n", path);
+    }
+#endif
+
+out:
+    /* As long as we have a mapping, the file will remain. */
+#if _WIN32
+    if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+#else
+    if (fd >= 0)
+        close(fd);
+#endif
+
+    hr = d3d12_pipeline_library_create(device, cache->mapped, cache->mapped_size, true, &cache->library);
+    if (hr == (HRESULT)D3D12_ERROR_DRIVER_VERSION_MISMATCH)
+        INFO("Cannot load existing on-disk cache due to driver version mismatch.\n");
+    else if (hr == (HRESULT)D3D12_ERROR_ADAPTER_NOT_FOUND)
+        INFO("Cannot load existing on-disk cache due to driver version mismatch.\n");
+    else if (FAILED(hr))
+        INFO("Failed to load driver cache with hr #%x, falling back to empty cache.\n", hr);
+
+    if (FAILED(hr))
+        hr = d3d12_pipeline_library_create(device, NULL, 0, true, &cache->library);
+
+    if (SUCCEEDED(hr))
+    {
+        cache->thread_active = true;
+        if ((rc = pthread_mutex_init(&cache->lock, NULL)) < 0)
+            goto mutex_fail;
+        if ((rc = condvar_reltime_init(&cache->cond)) < 0)
+            goto cond_fail;
+        if ((rc = pthread_create(&cache->thread, NULL, vkd3d_pipeline_library_disk_thread_main, cache)) < 0)
+            goto thread_fail;
+    }
+
+    return hr;
+
+thread_fail:
+    condvar_reltime_destroy(&cache->cond);
+cond_fail:
+    pthread_mutex_destroy(&cache->lock);
+mutex_fail:
+    ERR("Failed to start pipeline library disk thread.\n");
+    cache->thread_active = false;
+    return hr;
+}
+
+static void vkd3d_pipeline_library_update_disk_cache_locked(
+        struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    void *serialize_map = NULL;
+    size_t serialize_size = 0;
+    bool do_rename = false;
+    HRESULT hr;
+
+#ifdef _WIN32
+    HANDLE file_mapping = INVALID_HANDLE_VALUE;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    DWORD code;
+#else
+    int fd = -1;
+#endif
+
+    serialize_size = d3d12_pipeline_library_get_serialized_size(cache->library);
+
+#ifdef _WIN32
+    handle = CreateFileA(cache->tmp_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, INVALID_HANDLE_VALUE);
+
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        file_mapping = CreateFileMappingA(handle, NULL, PAGE_READWRITE,
+                (DWORD)(((uint64_t)serialize_size) >> 32),
+                (DWORD)(serialize_size & 0xffffffffu), NULL);
+
+        if (file_mapping != INVALID_HANDLE_VALUE)
+        {
+            serialize_map = MapViewOfFile(file_mapping, FILE_MAP_ALL_ACCESS, 0, 0, serialize_size);
+            CloseHandle(file_mapping);
+        }
+        CloseHandle(handle);
+
+        if (file_mapping == INVALID_HANDLE_VALUE || !serialize_map)
+        {
+            ERR("Failed to MapViewOfFile disk cache.\n");
+        }
+        else
+        {
+            if (FAILED(hr = d3d12_pipeline_library_serialize(cache->library, serialize_map, serialize_size)))
+            {
+                ERR("Failed to serialize disk cache, hr #%x.\n", hr);
+            }
+            else
+            {
+                INFO("Successfully serialized disk cache (%"PRIu64" bytes).\n",
+                        serialize_size);
+                do_rename = true;
+            }
+        }
+
+        if (serialize_map)
+            UnmapViewOfFile(serialize_map);
+    }
+    else
+        INFO("Failed to open disk cache %s for writing.\n", cache->tmp_path);
+#else
+    fd = open(cache->tmp_path, O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (fd >= 0)
+    {
+        if (ftruncate64(fd, serialize_size) < 0)
+        {
+            ERR("Failed to resize tmp file to %"PRIu64" bytes.\n", (uint64_t)serialize_size);
+        }
+        else
+        {
+            serialize_map = mmap(NULL, serialize_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+
+            if (serialize_map == MAP_FAILED)
+            {
+                ERR("Failed to mmap disk cache.\n");
+                serialize_map = NULL;
+            }
+            else
+            {
+                if (FAILED(hr = d3d12_pipeline_library_serialize(cache->library, serialize_map, serialize_size)))
+                {
+                    ERR("Failed to serialize disk cache, hr #%x.\n", hr);
+                }
+                else
+                {
+                    INFO("Successfully serialized disk cache (%"PRIu64" bytes).\n",
+                            serialize_size);
+                    do_rename = true;
+                }
+
+                munmap(serialize_map, serialize_size);
+            }
+        }
+
+        close(fd);
+    }
+    else if (errno == EEXIST)
+        ERR("Temp path %s already exists. Stale from a failed run?\n", cache->tmp_path);
+    else
+        ERR("Failed to open tmp file %s.\n", cache->tmp_path);
+#endif
+
+    /* This is atomic. Other consumes of the cache will either see the new cache or old one. */
+    if (do_rename)
+    {
+#ifdef _WIN32
+        code = ERROR_SUCCESS;
+        if (!MoveFileA(cache->tmp_path, cache->path))
+        {
+            code = GetLastError();
+            if (code == ERROR_ALREADY_EXISTS)
+            {
+                code = ERROR_SUCCESS;
+                if (!ReplaceFileA(cache->path, cache->tmp_path, NULL, 0, NULL, NULL))
+                    code = GetLastError();
+            }
+        }
+
+        if (code != ERROR_SUCCESS)
+        {
+            INFO("Failed to replace %s with %s (code %x). Winking temporary cache out of existence ...\n",
+                    cache->path, cache->tmp_path, code);
+            DeleteFileA(cache->tmp_path);
+        }
+#else
+        if (rename(cache->tmp_path, cache->path) < 0)
+        {
+            ERR("Failed to replace %s with %s. Winking temporary cache out of existence ...\n",
+                    cache->path, cache->tmp_path);
+            unlink(cache->tmp_path);
+        }
+        else
+            INFO("Updated disk cache in %s.\n", cache->path);
+#endif
+    }
+}
+
+void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    if (cache->thread_active)
+    {
+        pthread_mutex_lock(&cache->lock);
+        cache->thread_active = false;
+        condvar_reltime_signal(&cache->cond);
+        pthread_mutex_unlock(&cache->lock);
+
+        pthread_join(cache->thread, NULL);
+        condvar_reltime_destroy(&cache->cond);
+        pthread_mutex_destroy(&cache->lock);
+    }
+
+    if (cache->library)
+        ID3D12PipelineLibrary_Release(&cache->library->ID3D12PipelineLibrary_iface);
+
+    if (cache->mapped)
+    {
+#ifdef _WIN32
+        UnmapViewOfFile(cache->mapped);
+#else
+        munmap(cache->mapped, cache->mapped_size);
+#endif
+    }
+}
+
+static void *vkd3d_pipeline_library_disk_thread_main(void *userarg)
+{
+    struct vkd3d_pipeline_library_disk_cache *cache = userarg;
+    bool active = true;
+    bool dirty = false;
+    int rc;
+
+    while (active)
+    {
+        pthread_mutex_lock(&cache->lock);
+
+        /* If new pipelines haven't been queued up for a while, flush out the disk cache.
+         * TODO: This system can and will be iterated on to make it less IO hungry ... */
+        rc = condvar_reltime_wait_timeout_seconds(&cache->cond, &cache->lock, 10);
+
+        /* Record any new pipeline states. */
+        active = cache->thread_active;
+        dirty = dirty || cache->internal_driver_cache_dirty;
+        cache->internal_driver_cache_dirty = false;
+
+        pthread_mutex_unlock(&cache->lock);
+
+        if (rc > 0)
+        {
+            /* Timeout, try to flush. */
+            if (dirty)
+            {
+                rwlock_lock_read(&cache->library->mutex);
+                vkd3d_pipeline_library_update_disk_cache_locked(cache);
+                rwlock_unlock_read(&cache->library->mutex);
+                dirty = false;
+            }
+        }
+        else if (rc < 0)
+        {
+            ERR("Error waiting for condition variable in library disk thread.\n");
+            break;
+        }
+    }
+
+    if (dirty)
+    {
+        rwlock_lock_read(&cache->library->mutex);
+        vkd3d_pipeline_library_update_disk_cache_locked(cache);
+        rwlock_unlock_read(&cache->library->mutex);
+    }
+
+    return NULL;
 }
