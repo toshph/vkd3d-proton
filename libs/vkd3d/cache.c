@@ -1729,7 +1729,7 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
     };
     unsigned int output_index = 0;
     uint64_t state_hash;
-    unsigned int i, j;
+    unsigned int i;
 
     state_hash = hash_fnv1_init();
 
@@ -1760,20 +1760,20 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
 
         /* Per-RT state */
         H32(desc->rtv_formats.NumRenderTargets);
-        for (j = 0; j < desc->rtv_formats.NumRenderTargets; j++)
+        for (i = 0; i < desc->rtv_formats.NumRenderTargets; i++)
         {
-            H32(desc->blend_state.RenderTarget[j].RenderTargetWriteMask);
-            H32(desc->blend_state.RenderTarget[j].BlendEnable);
-            H32(desc->blend_state.RenderTarget[j].LogicOpEnable);
-            H32(desc->blend_state.RenderTarget[j].DestBlend);
-            H32(desc->blend_state.RenderTarget[j].DestBlendAlpha);
-            H32(desc->blend_state.RenderTarget[j].SrcBlend);
-            H32(desc->blend_state.RenderTarget[j].SrcBlendAlpha);
-            H32(desc->blend_state.RenderTarget[j].BlendOp);
-            H32(desc->blend_state.RenderTarget[j].BlendOpAlpha);
-            H32(desc->blend_state.RenderTarget[j].LogicOpEnable);
-            H32(desc->blend_state.RenderTarget[j].LogicOp);
-            H32(desc->rtv_formats.RTFormats[j]);
+            H32(desc->blend_state.RenderTarget[i].RenderTargetWriteMask);
+            H32(desc->blend_state.RenderTarget[i].BlendEnable);
+            H32(desc->blend_state.RenderTarget[i].LogicOpEnable);
+            H32(desc->blend_state.RenderTarget[i].DestBlend);
+            H32(desc->blend_state.RenderTarget[i].DestBlendAlpha);
+            H32(desc->blend_state.RenderTarget[i].SrcBlend);
+            H32(desc->blend_state.RenderTarget[i].SrcBlendAlpha);
+            H32(desc->blend_state.RenderTarget[i].BlendOp);
+            H32(desc->blend_state.RenderTarget[i].BlendOpAlpha);
+            H32(desc->blend_state.RenderTarget[i].LogicOpEnable);
+            H32(desc->blend_state.RenderTarget[i].LogicOp);
+            H32(desc->rtv_formats.RTFormats[i]);
         }
 
         H32(desc->sample_mask);
@@ -1810,7 +1810,7 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
 
         /* Input layout. */
         H32(desc->input_layout.NumElements);
-        for (j = 0; j < desc->input_layout.NumElements; j++)
+        for (i = 0; i < desc->input_layout.NumElements; i++)
         {
             HS(desc->input_layout.pInputElementDescs[i].SemanticName);
             H32(desc->input_layout.pInputElementDescs[i].SemanticIndex);
@@ -1831,10 +1831,10 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
 
         /* View instancing */
         H32(desc->view_instancing_desc.ViewInstanceCount);
-        for (j = 0; j < desc->view_instancing_desc.ViewInstanceCount; j++)
+        for (i = 0; i < desc->view_instancing_desc.ViewInstanceCount; i++)
         {
-            H32(desc->view_instancing_desc.pViewInstanceLocations[j].RenderTargetArrayIndex);
-            H32(desc->view_instancing_desc.pViewInstanceLocations[j].ViewportArrayIndex);
+            H32(desc->view_instancing_desc.pViewInstanceLocations[i].RenderTargetArrayIndex);
+            H32(desc->view_instancing_desc.pViewInstanceLocations[i].ViewportArrayIndex);
         }
         H32(desc->view_instancing_desc.Flags);
     }
