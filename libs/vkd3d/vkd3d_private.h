@@ -1513,6 +1513,7 @@ struct d3d12_compute_pipeline_state
  * otherwise, we must regard the PSO as incompatible (which is invalid usage and must be validated). */
 struct vkd3d_pipeline_cache_compatibility
 {
+    uint64_t state_desc_compat_hash;
     uint64_t root_signature_compat_hash;
     uint64_t dxbc_blob_hashes[VKD3D_MAX_SHADER_STAGES];
 };
@@ -1680,6 +1681,8 @@ VkResult vkd3d_serialize_pipeline_state(struct d3d12_pipeline_library *pipeline_
 HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *state,
         const struct vkd3d_pipeline_cache_compatibility *compat);
+void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_compatibility *compat,
+        const struct d3d12_pipeline_state_desc *desc);
 
 struct vkd3d_buffer
 {

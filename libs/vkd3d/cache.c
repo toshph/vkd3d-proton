@@ -317,6 +317,13 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
         return E_FAIL;
     pso_compat = CONST_CAST_CHUNK_DATA(chunk, pso_compat);
 
+    /* Verify the expected PSO state that was used. This must match, or we have to fail compilation as per API spec. */
+    if (compat->state_desc_compat_hash != pso_compat->compat.state_desc_compat_hash)
+    {
+        WARN("PSO compatibility hash mismatch.\n");
+        return E_INVALIDARG;
+    }
+
     /* Verify the expected root signature that was used to generate the SPIR-V. */
     if (compat->root_signature_compat_hash != pso_compat->compat.root_signature_compat_hash)
     {
@@ -1698,4 +1705,147 @@ HRESULT d3d12_pipeline_library_create(struct d3d12_device *device, const void *b
 
     *pipeline_library = object;
     return S_OK;
+}
+
+void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_compatibility *compat,
+        const struct d3d12_pipeline_state_desc *desc)
+{
+    const D3D12_SHADER_BYTECODE *code_list[] = {
+        &desc->vs,
+        &desc->hs,
+        &desc->ds,
+        &desc->gs,
+        &desc->ps,
+        &desc->cs,
+    };
+    unsigned int output_index = 0;
+    uint64_t state_hash;
+    unsigned int i, j;
+
+    state_hash = hash_fnv1_init();
+
+    /* Combined, all this information should serve as a unique key for a PSO.
+     * TODO: Use this to look up cached PSOs in on-disk caches. */
+#define H8(v) state_hash = hash_fnv1_iterate_u8(state_hash, v)
+#define H32(v) state_hash = hash_fnv1_iterate_u32(state_hash, v)
+#define HF32(v) state_hash = hash_fnv1_iterate_f32(state_hash, v)
+#define HS(v) state_hash = hash_fnv1_iterate_string(state_hash, v)
+    if (!desc->cs.BytecodeLength)
+    {
+        H32(desc->stream_output.RasterizedStream);
+        H32(desc->stream_output.NumEntries);
+        H32(desc->stream_output.NumStrides);
+        for (i = 0; i < desc->stream_output.NumStrides; i++)
+            H32(desc->stream_output.pBufferStrides[i]);
+        for (i = 0; i < desc->stream_output.NumEntries; i++)
+        {
+            H32(desc->stream_output.pSODeclaration[i].ComponentCount);
+            H32(desc->stream_output.pSODeclaration[i].OutputSlot);
+            H32(desc->stream_output.pSODeclaration[i].SemanticIndex);
+            H32(desc->stream_output.pSODeclaration[i].StartComponent);
+            H32(desc->stream_output.pSODeclaration[i].Stream);
+            HS(desc->stream_output.pSODeclaration[i].SemanticName);
+        }
+        H32(desc->blend_state.IndependentBlendEnable);
+        H32(desc->blend_state.AlphaToCoverageEnable);
+
+        /* Per-RT state */
+        H32(desc->rtv_formats.NumRenderTargets);
+        for (j = 0; j < desc->rtv_formats.NumRenderTargets; j++)
+        {
+            H32(desc->blend_state.RenderTarget[j].RenderTargetWriteMask);
+            H32(desc->blend_state.RenderTarget[j].BlendEnable);
+            H32(desc->blend_state.RenderTarget[j].LogicOpEnable);
+            H32(desc->blend_state.RenderTarget[j].DestBlend);
+            H32(desc->blend_state.RenderTarget[j].DestBlendAlpha);
+            H32(desc->blend_state.RenderTarget[j].SrcBlend);
+            H32(desc->blend_state.RenderTarget[j].SrcBlendAlpha);
+            H32(desc->blend_state.RenderTarget[j].BlendOp);
+            H32(desc->blend_state.RenderTarget[j].BlendOpAlpha);
+            H32(desc->blend_state.RenderTarget[j].LogicOpEnable);
+            H32(desc->blend_state.RenderTarget[j].LogicOp);
+            H32(desc->rtv_formats.RTFormats[j]);
+        }
+
+        H32(desc->sample_mask);
+
+        /* Raster state */
+        H32(desc->rasterizer_state.FillMode);
+        H32(desc->rasterizer_state.CullMode);
+        H32(desc->rasterizer_state.FrontCounterClockwise);
+        H32(desc->rasterizer_state.DepthBias);
+        HF32(desc->rasterizer_state.DepthBiasClamp);
+        HF32(desc->rasterizer_state.SlopeScaledDepthBias);
+        H32(desc->rasterizer_state.DepthClipEnable);
+        H32(desc->rasterizer_state.MultisampleEnable);
+        H32(desc->rasterizer_state.AntialiasedLineEnable);
+        H32(desc->rasterizer_state.ForcedSampleCount);
+        H32(desc->rasterizer_state.ConservativeRaster);
+
+        /* Depth-stencil state. */
+        H32(desc->depth_stencil_state.DepthEnable);
+        H32(desc->depth_stencil_state.DepthWriteMask);
+        H32(desc->depth_stencil_state.DepthFunc);
+        H32(desc->depth_stencil_state.StencilEnable);
+        H32(desc->depth_stencil_state.StencilReadMask);
+        H32(desc->depth_stencil_state.StencilWriteMask);
+        H32(desc->depth_stencil_state.FrontFace.StencilFailOp);
+        H32(desc->depth_stencil_state.FrontFace.StencilDepthFailOp);
+        H32(desc->depth_stencil_state.FrontFace.StencilPassOp);
+        H32(desc->depth_stencil_state.FrontFace.StencilFunc);
+        H32(desc->depth_stencil_state.BackFace.StencilFailOp);
+        H32(desc->depth_stencil_state.BackFace.StencilDepthFailOp);
+        H32(desc->depth_stencil_state.BackFace.StencilPassOp);
+        H32(desc->depth_stencil_state.BackFace.StencilFunc);
+        H32(desc->depth_stencil_state.DepthBoundsTestEnable);
+
+        /* Input layout. */
+        H32(desc->input_layout.NumElements);
+        for (j = 0; j < desc->input_layout.NumElements; j++)
+        {
+            HS(desc->input_layout.pInputElementDescs[i].SemanticName);
+            H32(desc->input_layout.pInputElementDescs[i].SemanticIndex);
+            H32(desc->input_layout.pInputElementDescs[i].Format);
+            H32(desc->input_layout.pInputElementDescs[i].InputSlot);
+            H32(desc->input_layout.pInputElementDescs[i].AlignedByteOffset);
+            H32(desc->input_layout.pInputElementDescs[i].InputSlotClass);
+            H32(desc->input_layout.pInputElementDescs[i].InstanceDataStepRate);
+        }
+
+        H32(desc->strip_cut_value);
+        H32(desc->primitive_topology_type);
+        H32(desc->dsv_format);
+
+        /* Sample desc */
+        H32(desc->sample_desc.Count);
+        H32(desc->sample_desc.Quality);
+
+        /* View instancing */
+        H32(desc->view_instancing_desc.ViewInstanceCount);
+        for (j = 0; j < desc->view_instancing_desc.ViewInstanceCount; j++)
+        {
+            H32(desc->view_instancing_desc.pViewInstanceLocations[j].RenderTargetArrayIndex);
+            H32(desc->view_instancing_desc.pViewInstanceLocations[j].ViewportArrayIndex);
+        }
+        H32(desc->view_instancing_desc.Flags);
+    }
+    H32(desc->node_mask);
+    H32(desc->flags);
+#undef H8
+#undef H32
+#undef HF32
+#undef HS
+
+    compat->state_desc_compat_hash = state_hash;
+
+    for (i = 0; i < ARRAY_SIZE(code_list) && output_index < ARRAY_SIZE(compat->dxbc_blob_hashes); i++)
+    {
+        if (code_list[i]->BytecodeLength)
+        {
+            const struct vkd3d_shader_code dxbc = { code_list[i]->pShaderBytecode, code_list[i]->BytecodeLength };
+            compat->dxbc_blob_hashes[output_index] = vkd3d_shader_hash(&dxbc);
+            compat->dxbc_blob_hashes[output_index] = hash_fnv1_iterate_u8(compat->dxbc_blob_hashes[output_index], i);
+            output_index++;
+        }
+    }
 }

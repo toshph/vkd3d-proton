@@ -3952,30 +3952,6 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device 
             bytecode->pShaderBytecode, bytecode->BytecodeLength, &IID_ID3D12RootSignature, (void**)root_signature);
 }
 
-static void vkd3d_pipeline_cache_compat_from_dxbc(struct vkd3d_pipeline_cache_compatibility *compat,
-        const struct d3d12_pipeline_state_desc *desc)
-{
-    const D3D12_SHADER_BYTECODE *code_list[] = {
-        &desc->vs,
-        &desc->hs,
-        &desc->ds,
-        &desc->gs,
-        &desc->ps,
-        &desc->cs,
-    };
-    unsigned int output_index = 0;
-    unsigned int i;
-
-    for (i = 0; i < ARRAY_SIZE(code_list) && output_index < ARRAY_SIZE(compat->dxbc_blob_hashes); i++)
-    {
-        if (code_list[i]->BytecodeLength)
-        {
-            const struct vkd3d_shader_code dxbc = { code_list[i]->pShaderBytecode, code_list[i]->BytecodeLength };
-            compat->dxbc_blob_hashes[output_index++] = vkd3d_shader_hash(&dxbc);
-        }
-    }
-}
-
 HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
 {
@@ -4003,7 +3979,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     else
         root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
 
-    vkd3d_pipeline_cache_compat_from_dxbc(&object->pipeline_cache_compat, desc);
+    vkd3d_pipeline_cache_compat_from_state_desc(&object->pipeline_cache_compat, desc);
     if (root_signature)
         object->pipeline_cache_compat.root_signature_compat_hash = root_signature->compatibility_hash;
 
